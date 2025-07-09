@@ -46,23 +46,27 @@ string EscapeJsonString(string text) {
     for (int i = 0; i < len; i++) {
         char ch = StringGetCharacter(text, i);
         switch (ch) {
-            case '\\': result += "\\\\"; break;
-            case '"':  result += "\\\""; break;
-            case '\b': result += "\\b"; break;
-            case '\f': result += "\\f"; break;
-            case '\n': result += "\\n"; break;
-            case '\r': result += "\\r"; break;
-            case '\t': result += "\\t"; break;
+            case '\\': result += "\\\\"; break; // Backslash
+            case '"':  result += "\\\""; break; // Double quote
+            case 8:    result += "\\b";  break; // Backspace
+            case 12:   result += "\\f";  break; // Form feed
+            case 10:   result += "\\n";  break; // Newline
+            case 13:   result += "\\r";  break; // Carriage return
+            case 9:    result += "\\t";  break; // Tab
+            // Note: Forward slash '/' is a valid character in JSON strings and typically doesn't need escaping unless for HTML embedding.
+            // case '/':  result += "\\/";  break;
             default:
-                if (ch < 32) {
-                    // Basic handling for other control characters if necessary
-                    // string temp; StringFormat(temp, "\\u%04x", ch); result += temp; // Proper JSON unicode escape
-                    // For simplicity, the original illustrative version is kept,
-                    // but robust JSON handling might require more.
-                    // Or simply filter them if they are not expected.
-                    result += CharToStr(ch); // Pass through for now
+                if (ch < 32 || ch == 127) { // Control characters (0-31) and DEL (127)
+                    string temp;
+                    // Format as \\uXXXX - standard JSON Unicode escape
+                    temp = "\\u00"; // All these are in the 00xx range
+                    int h1 = ch / 16;
+                    int h2 = ch % 16;
+                    StringAppend(temp, h1 < 10 ? (string)h1 : CharToStr((char)('A' + h1 - 10)));
+                    StringAppend(temp, h2 < 10 ? (string)h2 : CharToStr((char)('A' + h2 - 10)));
+                    result += temp;
                 } else {
-                    result += CharToStr(ch);
+                    result += CharToStr(ch); // Regular character
                 }
         }
     }
