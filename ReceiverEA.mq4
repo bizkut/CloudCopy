@@ -11,22 +11,23 @@
 //--- Include necessary libraries
 #include <WinSock2.mqh> // For socket functions
 #include <stdlib.mqh>   // For StringToDouble, StringToInteger, etc.
-#include <Trade\Trade.mqh> // For CTrade class (MQL5 style, might need MQL4 equivalent or direct order functions)
+#include <Trade\Trade.mqh> // For CTrade class (MQL5 style, can be helpful but direct functions used for MQL4)
 
 //--- Input parameters
 input string ServerAddress = "metaapi.gametrader.my";
 input int ServerPort = 3000;
 input string ReceiverAccountId = "ReceiverAccount456"; // To identify this receiver account on the server
 input string SenderAccountIdToFollow = "SenderAccount123"; // Which sender account to listen to
+input int MagicNumberReceiver = 12345; // Magic number for trades opened by this EA
 
 //--- Global variables
 int ExtSocketHandle = INVALID_SOCKET;
 bool ExtIsConnected = false;
 datetime ExtLastHeartbeatSent = 0;
-int ExtHeartbeatInterval = 30; // Seconds (should match sender's logic for server expectations)
+int ExtHeartbeatInterval = 30; // Seconds
 string ExtSocketBuffer = ""; // Buffer for incoming socket data
 
-CTrade ExtTrade; // For trade operations (MQL5 style, adjust for MQL4 if needed)
+// CTrade ExtTrade; // Using direct MQL4 order functions instead of CTrade for this version.
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -184,29 +185,27 @@ void ReceiveMessages()
     int bytesRead = 0;
 
     // Non-blocking read
-    // SocketIsReadable is one way, or just try to receive with MSG_DONTWAIT if available
-    // For MQL4, SocketRecv might block if not set to non-blocking, or return 0/-1 if no data.
+    // SocketIsReadable is one way, or just try to receive.
     // If socket is non-blocking, SocketRecv should return -1 and GetLastError() == WSAEWOULDBLOCK if no data.
 
     ZeroMemory(buffer);
-    bytesRead = SocketRecv(ExtSocketHandle, buffer, sizeof(buffer) - 1, 0); // Last param flags, 0 for none
+    // For non-blocking sockets, we expect this to return immediately.
+    // MSG_PEEK could be used to check for data without removing it, but not standard in WinSock2.mqh's SocketRecv typically.
+    // The standard approach is to call recv and check for WSAEWOULDBLOCK.
+    bytesRead = SocketRecv(ExtSocketHandle, buffer, sizeof(buffer) - 1, 0);
 
-    if (bytesRead > 0)
-    {
-        buffer[bytesRead] = 0; // Null-terminate the string
+    if (bytesRead > 0) {
+        buffer[bytesRead] = 0; // Null-terminate
         ExtSocketBuffer += CharArrayToString(buffer, 0, bytesRead);
-        //Print("Received ", bytesRead, " bytes. Buffer: '", ExtSocketBuffer, "'");
+        //Print("DEBUG: Received ", bytesRead, " bytes. Buffer now: '", ExtSocketBuffer, "'");
 
-        // Process complete messages (newline delimited)
         int newlinePos;
-        while ((newlinePos = StringFind(ExtSocketBuffer, "\n")) != -1)
-        {
+        while ((newlinePos = StringFind(ExtSocketBuffer, "\n")) != -1) {
             string message = StringSubstr(ExtSocketBuffer, 0, newlinePos);
             ExtSocketBuffer = StringSubstr(ExtSocketBuffer, newlinePos + 1);
 
-            if (StringTrim(message) != "")
-            {
-                //Print("Processing message: ", message);
+            if (StringTrim(message) != "") {
+                Print("Processing message: ", message);
                 ProcessServerMessage(message);
             }
         }
@@ -241,193 +240,295 @@ void ProcessServerMessage(string message)
     Print("Server message: ", message);
     // Basic JSON parsing (MQL4 doesn't have a built-in JSON parser)
     // This is a very simplified parser. A robust one is complex.
-    // Example: {"type":"tradeEvent", "accountId":"SenderAccount123", "order":{...}}
+    string msgType = ParseJsonValue(message, "type");
 
-    // For now, let's assume the message is a trade event if not an ack
-    // A real implementation needs a JSON parser.
-    // We'll crudely check for "tradeEvent" and "order" keys.
-
-    if (StringFind(message, "\"type\":\"ack\"") != -1) {
-        //Print("Received ACK from server: ", message);
+    if (msgType == "ack") {
+        // Print("Received ACK from server: ", message);
         return;
     }
-    if (StringFind(message, "\"type\":\"error\"") != -1) {
+    if (msgType == "error") {
         Print("Received ERROR from server: ", message);
         return;
     }
 
-
-    if (StringFind(message, "\"type\":\"tradeEvent\"") != -1)
-    {
-        // This is where the complex part of parsing the JSON and acting on it goes.
-        // For MQL4, you'd need a custom JSON parsing routine or a library.
-        // Let's extract some common fields using string manipulation for demonstration.
-        // THIS IS NOT A ROBUST JSON PARSER.
-
-        string symbol = GetJsonStringValue(message, "symbol");
-        string orderTypeStr = GetJsonStringValue(message, "\"type\"", StringFind(message, "\"order\":")); // type within order object
-        double lots = StringToDouble(GetJsonStringValue(message, "lots"));
-        double price = StringToDouble(GetJsonStringValue(message, "openPrice")); // Assuming new order for now
-        double sl = StringToDouble(GetJsonStringValue(message, "stopLoss"));
-        double tp = StringToDouble(GetJsonStringValue(message, "takeProfit"));
-        long orderTicket = (long)StringToInteger(GetJsonStringValue(message, "ticket")); // Original sender's ticket
-        string comment = "Copied from " + SenderAccountIdToFollow + " (Ticket: " + (string)orderTicket + ")";
-
-        // Transaction type can be used to determine if it's a new order, modify, or close
-        // string transactionType = GetJsonStringValue(message, "transactionType"); // e.g., "TRADE_TRANSACTION_ORDER_ADD"
-
-        // For simplicity, we'll only handle new market orders (BUY/SELL)
-        // And we'll assume the "order" object contains the primary details.
-        // We also need to parse the "type" from within the "order" object.
-        // The sender sends MqlTradeTransaction, so we need to look at "order.type" for OP_BUY etc.
-        // and "transactionType" at the root to see if it's an add/update/remove.
-
-        string orderObjStr = GetJsonObject(message, "order");
-        if (orderObjStr == "") {
-            Print("No 'order' object in tradeEvent: ", message);
+    if (msgType == "tradeEvent") {
+        string accountId = ParseJsonValue(message, "accountId");
+        if (accountId != SenderAccountIdToFollow) {
+            Print("Ignoring trade event from wrong sender: ", accountId);
             return;
         }
 
-        int tradeAction = -1; // 0 for BUY, 1 for SELL
-        int orderTypeValue = StringToInteger(GetJsonStringValue(orderObjStr, "type"));
+        string orderJson = GetJsonObjectString(message, "order");
+        string dealJson = GetJsonObjectString(message, "deal");
+        // MQL5's OnTradeTransaction sends transactionType, which indicates the action.
+        // e.g. TRADE_TRANSACTION_ORDER_ADD, TRADE_TRANSACTION_ORDER_UPDATE, TRADE_TRANSACTION_DEAL
+        // For MQL4, the sender would need to determine this and send a clear "action" field.
+        // Assuming sender adds an "action" field: "NEW", "MODIFY", "CLOSE"
+        // Or we infer from transactionType (MQL5 style) or deal details.
 
-        switch(orderTypeValue) {
-            case 0: // OP_BUY
-                tradeAction = OP_BUY;
-                break;
-            case 1: // OP_SELL
-                tradeAction = OP_SELL;
-                break;
-            // Extend for OP_BUYLIMIT, OP_SELLLIMIT etc. if needed
-            default:
-                Print("Unsupported order type in message: ", orderTypeValue);
-                return;
+        // Let's try to infer based on typical MQL5 transaction types the sender might forward
+        string transactionType = ParseJsonValue(message, "transactionType"); // e.g. "TRADE_TRANSACTION_ORDER_ADD"
+        long senderOrderTicket = StringToInteger(ParseJsonValue(orderJson, "ticket"));
+
+        if (transactionType == "TRADE_TRANSACTION_ORDER_ADD" || (transactionType == "TRADE_TRANSACTION_DEAL" && ParseJsonValue(dealJson,"entry") == "DEAL_ENTRY_IN")) {
+            HandleOpenTrade(orderJson, senderOrderTicket);
+        } else if (transactionType == "TRADE_TRANSACTION_ORDER_UPDATE") {
+            HandleModifyTrade(orderJson, senderOrderTicket);
+        } else if (transactionType == "TRADE_TRANSACTION_DEAL" && ParseJsonValue(dealJson,"entry") == "DEAL_ENTRY_OUT") {
+            // A DEAL_ENTRY_OUT means a position was closed or partially closed.
+            // We need the order ticket associated with this deal to find our copied trade.
+            long dealOrderTicket = StringToInteger(ParseJsonValue(dealJson, "order"));
+            if (dealOrderTicket == 0 && senderOrderTicket != 0) dealOrderTicket = senderOrderTicket; // Fallback if deal.order is not the one we track
+
+            HandleCloseTrade(ParseJsonValue(orderJson, "symbol"), dealOrderTicket, StringToDouble(ParseJsonValue(dealJson, "lots")));
+        } else {
+            Print("Unhandled transactionType or combination: ", transactionType, " with order: ", orderJson, " and deal: ", dealJson);
         }
-
-        if (symbol != "" && lots > 0 && tradeAction != -1)
-        {
-            // Normalize SL/TP (ensure they are valid distances if relative, or absolute values)
-            // For simplicity, assume they are absolute values or 0.
-            if (sl != 0) sl = NormalizeDouble(sl, MarketInfo(symbol, MODE_DIGITS));
-            if (tp != 0) tp = NormalizeDouble(tp, MarketInfo(symbol, MODE_DIGITS));
-            if (price == 0 && (tradeAction == OP_BUY || tradeAction == OP_SELL)) { // Market order
-                price = (tradeAction == OP_BUY) ? MarketInfo(symbol, MODE_ASK) : MarketInfo(symbol, MODE_BID);
-            } else {
-                price = NormalizeDouble(price, MarketInfo(symbol, MODE_DIGITS));
-            }
-
-
-            Print("Attempting to execute trade: ", EnumToString(tradeAction), " ", symbol, " ", lots, " lots, P: ", price, " SL: ", sl, " TP: ", tp);
-
-            // Using MQL4 direct OrderSend
-            int ticket = OrderSend(symbol, tradeAction, lots, price, 3, sl, tp, comment, 0, 0, CLR_NONE);
-
-            if (ticket > 0)
-            {
-                Print("Trade opened successfully. Ticket: ", ticket);
-            }
-            else
-            {
-                Print("Failed to open trade. Error: ", GetLastError());
-            }
-        }
-        else
-        {
-            Print("Could not parse necessary trade details from message or invalid trade params.");
-            Print("Symbol: '", symbol, "', Lots: ", lots, ", Action: ", tradeAction, " (OrderTypeVal:", orderTypeValue, ")");
-            Print("Order Object String: ", orderObjStr);
-        }
+    } else {
+        Print("Received unhandled message type '", msgType, "' or format: ", message);
     }
-    else
-    {
-        Print("Received unhandled message type or format: ", message);
+}
+
+//+------------------------------------------------------------------+
+//| Handle Open Trade Signal                                         |
+//+------------------------------------------------------------------+
+void HandleOpenTrade(string orderJson, long senderTicket) {
+    string symbol = ParseJsonValue(orderJson, "symbol");
+    int orderType = StringToInteger(ParseJsonValue(orderJson, "type")); // OP_BUY, OP_SELL etc.
+    double lots = StringToDouble(ParseJsonValue(orderJson, "lots"));
+    double price = StringToDouble(ParseJsonValue(orderJson, "openPrice")); // For market orders, this is indicative.
+    double sl = StringToDouble(ParseJsonValue(orderJson, "stopLoss"));
+    double tp = StringToDouble(ParseJsonValue(orderJson, "takeProfit"));
+    // string senderComment = ParseJsonValue(orderJson, "comment"); // We'll create our own
+
+    if (symbol == "" || lots <= 0 || (orderType != OP_BUY && orderType != OP_SELL)) { // Simplified: only market orders
+        Print("OpenTrade: Invalid parameters. Symbol:", symbol, " Lots:", lots, " Type:", orderType);
+        return;
+    }
+
+    // Check if this trade (by sender's ticket) was already copied to prevent duplicates from re-processed messages
+    if (FindCopiedTrade(symbol, senderTicket, orderType) != -1) {
+        Print("OpenTrade: Trade for sender ticket ", senderTicket, " on ", symbol, " already exists. Ignoring duplicate open signal.");
+        return;
+    }
+
+    string comment = "CPY:" + SenderAccountIdToFollow + ":" + (string)senderTicket;
+
+    // For market orders, get current prices
+    if (orderType == OP_BUY) price = MarketInfo(symbol, MODE_ASK);
+    if (orderType == OP_SELL) price = MarketInfo(symbol, MODE_BID);
+
+    // Normalize SL/TP (ensure they are valid distances if relative, or absolute values)
+    if (sl != 0) sl = NormalizeDouble(sl, MarketInfo(symbol, MODE_DIGITS)); else sl = 0;
+    if (tp != 0) tp = NormalizeDouble(tp, MarketInfo(symbol, MODE_DIGITS)); else tp = 0;
+    price = NormalizeDouble(price, MarketInfo(symbol, MODE_DIGITS));
+
+    Print("Attempting to OPEN: ", EnumToString(orderType), " ", symbol, " ", lots, " lots @ ", DoubleToString(price,Digits), " SL:", sl, " TP:", tp, " Comment:", comment);
+    int ticket = OrderSend(symbol, orderType, lots, price, 3, sl, tp, comment, MagicNumberReceiver, 0, CLR_NONE);
+
+    if (ticket > 0) {
+        Print("Trade OPENED successfully. Receiver Ticket: ", ticket, " (Copied from Sender Ticket: ", senderTicket, ")");
+    } else {
+        Print("Failed to OPEN trade. Error: ", GetLastError());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Handle Modify Trade Signal (SL/TP)                               |
+//+------------------------------------------------------------------+
+void HandleModifyTrade(string orderJson, long senderTicket) {
+    string symbol = ParseJsonValue(orderJson, "symbol");
+    double sl = StringToDouble(ParseJsonValue(orderJson, "stopLoss"));
+    double tp = StringToDouble(ParseJsonValue(orderJson, "takeProfit"));
+    int orderType = StringToInteger(ParseJsonValue(orderJson, "type")); // To help identify if it's BUY or SELL for SL/TP validation
+
+    if (symbol == "") {
+        Print("ModifyTrade: Symbol is empty.");
+        return;
+    }
+
+    int receiverTicket = FindCopiedTrade(symbol, senderTicket, orderType);
+    if (receiverTicket == -1) {
+        Print("ModifyTrade: Could not find copied trade for sender ticket ", senderTicket, " on ", symbol);
+        return;
+    }
+
+    if (!OrderSelect(receiverTicket, SELECT_BY_TICKET)) {
+        Print("ModifyTrade: Failed to select order ticket ", receiverTicket, ". Error: ", GetLastError());
+        return;
+    }
+
+    // Normalize SL/TP
+    if (sl != 0) sl = NormalizeDouble(sl, MarketInfo(symbol, MODE_DIGITS)); else sl = OrderStopLoss(); // Keep existing if 0
+    if (tp != 0) tp = NormalizeDouble(tp, MarketInfo(symbol, MODE_DIGITS)); else tp = OrderTakeProfit(); // Keep existing if 0
+
+    // Check if modification is necessary
+    if (MathAbs(OrderStopLoss() - sl) < Point*0.1 && MathAbs(OrderTakeProfit() - tp) < Point*0.1) {
+        Print("ModifyTrade: No change in SL/TP for ticket ", receiverTicket, ". SL: ", sl, ", TP: ", tp);
+        return;
+    }
+
+    Print("Attempting to MODIFY Ticket: ", receiverTicket, " Symbol: ", symbol, " New SL: ", sl, " New TP: ", tp);
+    bool modified = OrderModify(receiverTicket, OrderOpenPrice(), sl, tp, 0, CLR_NONE);
+
+    if (modified) {
+        Print("Trade MODIFIED successfully. Ticket: ", receiverTicket);
+    } else {
+        Print("Failed to MODIFY trade. Ticket: ", receiverTicket, " Error: ", GetLastError());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Handle Close Trade Signal                                        |
+//+------------------------------------------------------------------+
+void HandleCloseTrade(string symbol, long senderTicket, double closedLots) {
+    if (symbol == "") {
+        Print("CloseTrade: Symbol is empty.");
+        return;
+    }
+
+    // We need to find the trade based on symbol and sender's ticket in comment.
+    // The order type (BUY/SELL) might be needed if multiple positions for same symbol & sender ticket (unlikely with good comment).
+    // For now, assume comment is unique enough with symbol.
+    int receiverTicket = FindCopiedTrade(symbol, senderTicket, -1); // -1 for orderType means don't check it strictly
+
+    if (receiverTicket == -1) {
+        Print("CloseTrade: Could not find copied trade for sender ticket ", senderTicket, " on ", symbol);
+        return;
+    }
+
+    if (!OrderSelect(receiverTicket, SELECT_BY_TICKET)) {
+        Print("CloseTrade: Failed to select order ticket ", receiverTicket, ". Error: ", GetLastError());
+        return;
+    }
+
+    // Determine lots to close. If sender's `closedLots` is available and less than OrderLots(), it's a partial close.
+    // For simplicity, we'll assume full close if closedLots from signal matches OrderLots or is not reliably provided.
+    // The `dealJson` from sender should have the actual lots closed for that deal.
+    double lotsToClose = OrderLots();
+    if (closedLots > 0 && closedLots < OrderLots()) {
+       // Implement partial close if needed. For now, full close.
+       Print("CloseTrade: Signal indicates partial close of ", closedLots, " for ticket ", receiverTicket, ". Full close will be attempted for simplicity.");
+       // For true partial close: lotsToClose = closedLots;
+    } else if (closedLots == 0) { // If signal doesn't specify lots, assume full close
+        Print("CloseTrade: Signal did not specify lots to close for ticket ", receiverTicket, ". Assuming full close.");
+    }
+
+
+    Print("Attempting to CLOSE Ticket: ", receiverTicket, " Symbol: ", symbol, " Lots: ", lotsToClose);
+    bool closed = OrderClose(receiverTicket, lotsToClose, OrderClosePrice(), 3, CLR_NONE);
+
+    if (closed) {
+        Print("Trade CLOSED successfully. Ticket: ", receiverTicket);
+    } else {
+        Print("Failed to CLOSE trade. Ticket: ", receiverTicket, " Error: ", GetLastError());
     }
 }
 
 
 //+------------------------------------------------------------------+
-//| Helper to extract string value from simple JSON-like string      |
-//| THIS IS NOT A ROBUST JSON PARSER. It's very basic.               |
+//| Find a copied trade by its comment linking to sender's ticket    |
 //+------------------------------------------------------------------+
-string GetJsonStringValue(string jsonString, string key, int searchStartPos=0)
-{
-    string searchKey = "\"" + key + "\":";
-    int keyPos = StringFind(jsonString, searchKey, searchStartPos);
-    if (keyPos == -1) return "";
+int FindCopiedTrade(string symbol, long senderTicket, int orderTypeToMatch) {
+    string searchComment = "CPY:" + SenderAccountIdToFollow + ":" + (string)senderTicket;
+    for (int i = OrdersTotal() - 1; i >= 0; i--) {
+        if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
+            if (OrderSymbol() == symbol && OrderComment() == searchComment && OrderMagicNumber() == MagicNumberReceiver) {
+                if (orderTypeToMatch == -1 || OrderType() == orderTypeToMatch) { // -1 means any order type
+                    return OrderTicket();
+                }
+            }
+        }
+    }
+    return -1;
+}
 
-    int valueStartPos = keyPos + StringLen(searchKey);
 
-    // Check if value is a string (starts with quote)
-    if (StringGetCharacter(jsonString, valueStartPos) == '"')
-    {
+//+------------------------------------------------------------------+
+//| Improved JSON Value Extractor                                    |
+//| Extracts value for a key. Handles strings, numbers, booleans.    |
+//| NOTE: This is still a basic parser, not for complex/nested JSON. |
+//+------------------------------------------------------------------+
+string ParseJsonValue(string json, string key) {
+    string searchPattern = "\"" + key + "\":";
+    int keyPos = StringFind(json, searchPattern);
+
+    if (keyPos == -1) return ""; // Key not found
+
+    int valueStartPos = keyPos + StringLen(searchPattern);
+    char firstChar = StringGetCharacter(json, valueStartPos);
+
+    // Skip leading spaces if any after colon
+    while(firstChar == ' ' && valueStartPos < StringLen(json) -1) {
+        valueStartPos++;
+        firstChar = StringGetCharacter(json, valueStartPos);
+    }
+
+    if (firstChar == '"') { // String value
         valueStartPos++; // Skip the opening quote
-        int valueEndPos = StringFind(jsonString, "\"", valueStartPos);
-        if (valueEndPos == -1) return ""; // Malformed
-        return StringSubstr(jsonString, valueStartPos, valueEndPos - valueStartPos);
-    }
-    else // Assume it's a number or boolean (not enclosed in quotes in JSON)
-    {
-        int valueEndPos = StringFind(jsonString, ",", valueStartPos);
-        if (valueEndPos == -1) // Maybe it's the last element
-        {
-            valueEndPos = StringFind(jsonString, "}", valueStartPos);
-            if (valueEndPos == -1) return ""; // Malformed
-        }
-        return StringSubstr(jsonString, valueStartPos, valueEndPos - valueStartPos);
+        int valueEndPos = StringFind(json, "\"", valueStartPos);
+        if (valueEndPos == -1) return ""; // Malformed: no closing quote
+        return StringSubstr(json, valueStartPos, valueEndPos - valueStartPos);
+    } else { // Numeric or boolean or null value
+        int valueEndPos = StringLen(json);
+        int commaPos = StringFind(json, ",", valueStartPos);
+        int bracePos = StringFind(json, "}", valueStartPos);
+
+        if (commaPos != -1) valueEndPos = commaPos;
+        if (bracePos != -1 && bracePos < valueEndPos) valueEndPos = bracePos;
+
+        string val = StringSubstr(json, valueStartPos, valueEndPos - valueStartPos);
+        return StringTrim(val); // Trim spaces for values like 'true '
     }
 }
 
 //+------------------------------------------------------------------+
-//| Helper to extract a JSON object as a string                      |
+//| Get a nested JSON object as a string                             |
 //+------------------------------------------------------------------+
-string GetJsonObject(string jsonString, string key, int searchStartPos=0) {
-    string searchKey = "\"" + key + "\":{";
-    int keyPos = StringFind(jsonString, searchKey, searchStartPos);
-    if (keyPos == -1) return "";
+string GetJsonObjectString(string json, string key) {
+    string searchPattern = "\"" + key + "\":{";
+    int keyPos = StringFind(json, searchPattern);
 
-    int objectStartPos = keyPos + StringLen(searchKey) -1; // Include the opening brace
+    if (keyPos == -1) return ""; // Key not found or not an object
+
+    int objectStartPos = keyPos + StringLen(searchPattern) - 1; // Include the starting '{'
     int braceCount = 0;
-    for (int i = objectStartPos; i < StringLen(jsonString); i++) {
-        if (StringGetCharacter(jsonString, i) == '{') {
+    for (int i = objectStartPos; i < StringLen(json); i++) {
+        char currentChar = StringGetCharacter(json, i);
+        if (currentChar == '{') {
             braceCount++;
-        } else if (StringGetCharacter(jsonString, i) == '}') {
+        } else if (currentChar == '}') {
             braceCount--;
             if (braceCount == 0) {
-                return StringSubstr(jsonString, objectStartPos, i - objectStartPos + 1);
+                return StringSubstr(json, objectStartPos, i - objectStartPos + 1);
             }
         }
     }
-    return ""; // Malformed or object not found
+    return ""; // Malformed: object doesn't close properly
 }
 
-
 //+------------------------------------------------------------------+
-//| OnTick function (not strictly needed if OnTimer handles all)     |
+//| OnTick function                                                  |
 //+------------------------------------------------------------------+
-void OnTick()
-{
-    // Can be left empty if OnTimer is frequent enough (e.g. 1 sec)
-    // Or can be used for additional checks if necessary
+void OnTick() {
+    // Main logic is in OnTimer for periodic checks & message processing.
+    // OnTick can be used for more frequent updates if needed, but not primary for this EA's comms.
 }
 
 /*
 Trade Execution Notes:
-- The current trade execution logic is VERY basic. It only handles new market orders.
-- It does not handle modifications (SL/TP changes on existing orders).
-- It does not handle closing orders.
-- It does not manage magic numbers to distinguish its own trades vs manual trades (though the comment helps).
-- A robust implementation would need to:
-    1. Parse `transactionType` from the sender's message (e.g., "TRADE_TRANSACTION_ORDER_ADD", "TRADE_TRANSACTION_ORDER_UPDATE", "TRADE_TRANSACTION_ORDER_DELETE" or "DEAL_ENTRY_OUT" for closes).
-    2. For modifications/closes, identify the corresponding local order. This is tricky. The sender's ticket is not the receiver's ticket.
-       One way is to store a mapping: sender_ticket -> receiver_ticket when an order is first copied.
-       Or, use a unique ID generated by the sender for each trade lifecycle, sent with each event.
-    3. Implement `OrderModify()` and `OrderClose()` logic.
-    4. Handle partial fills, requotes, and other trading errors.
-    5. Consider lot size adjustments (e.g., risk management based on receiver's account balance).
-    6. The `CTrade` class (MQL5 style) is included but not fully used; direct `OrderSend` is used for MQL4 compatibility.
-       If `CTrade` or a similar MQL4 library for trading is available, it can simplify operations.
-- JSON Parsing: MQL4 lacks a native JSON parser. The `GetJsonStringValue` and `GetJsonObject` are extremely basic and error-prone.
-  A proper JSON parsing library for MQL4 is highly recommended for production.
-- SocketSetOption SO_NONBLOCK: This is important for EAs. The `SocketRecv` behavior with non-blocking sockets needs careful handling (checking for WSAEWOULDBLOCK).
+- JSON Parsing: `ParseJsonValue` and `GetJsonObjectString` are improvements but still basic.
+  A robust MQL4 JSON library is HIGHLY recommended for production.
+- Trade Identification: Uses a comment "CPY:<SenderAccountID>:<SenderTicketID>" and magic number.
+  This is crucial for `HandleModifyTrade` and `HandleCloseTrade`.
+- Error Handling: Basic `GetLastError()` checks are present. Production systems need more.
+- Partial Closes: `HandleCloseTrade` currently attempts full close. True partial close logic
+  would use the `closedLots` from the sender's deal information.
+- Idempotency: Added a check in `HandleOpenTrade` to prevent re-opening an already copied trade
+  based on sender's ticket and symbol. Similar checks might be needed for modify/close if signals
+  could be re-processed without unique event IDs from sender.
+- Transaction Types: The logic assumes sender provides `transactionType` (like MQL5) or can infer
+  from `deal.entry` for closes. If sender provides a simpler custom "action" field (e.g. "NEW", "MODIFY", "CLOSE"),
+  the conditions in `ProcessServerMessage` would need adjustment.
 */
-Print("ReceiverEA.mq4 script created.");
+// Print("ReceiverEA.mq4 script updated with more functional trade handling."); // Commented out for tool use
