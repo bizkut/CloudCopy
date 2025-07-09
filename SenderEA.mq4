@@ -1,189 +1,355 @@
 //+------------------------------------------------------------------+
 //|                                                     SenderEA.mq4 |
-//|                        Copyright 2023, Your Name/Company |
-//|                                             https://example.com |
+//|                        Copyright 2024, Your Name/Company         |
+//|                                             https://example.com  |
 //+------------------------------------------------------------------+
-#property copyright "Copyright 2023, Your Name/Company"
+#property copyright "Copyright 2024, Your Name/Company"
 #property link      "https://example.com"
-#property version   "1.00"
+#property version   "1.41" // Incremented version
 #property strict
 
 //--- Include necessary libraries
-#include <WinSock2.mqh> // For socket functions (assuming standard MQL4 include)
+// #include <WinSock2.mqh> // Commented out as it might be causing "can't open include file" error
+                       // Necessary constants are defined below.
+
+//--- Defines for Winsock constants (if WinSock2.mqh is not used or missing them)
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+#ifndef SOCK_STREAM
+#define SOCK_STREAM 1
+#endif
+#ifndef IPPROTO_TCP
+#define IPPROTO_TCP 6
+#endif
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET -1
+#endif
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR -1
+#endif
+#ifndef FIONBIO
+#define FIONBIO 0x8004667E
+#endif
+#ifndef WSAEWOULDBLOCK // Common Winsock error codes
+#define WSAEWOULDBLOCK 10035
+#endif
+#ifndef WSAEINPROGRESS
+#define WSAEINPROGRESS 10036
+#endif
+#ifndef WSAENOTCONN
+#define WSAENOTCONN    10057
+#endif
+#ifndef WSAECONNABORTED
+#define WSAECONNABORTED 10053
+#endif
+
+// For WSAStartup
+#ifndef WSADATA_SIZE_IN_INTS
+#define WSADATA_SIZE_IN_INTS 100
+#endif
+
+//--- Import ws2_32.dll functions
+#import "ws2_32.dll"
+int WSAStartup(ushort wVersionRequired, int &WSAData[]);
+int WSACleanup();
+int socket(int af, int type, int protocol);
+int closesocket(int s);
+int connect(int s, int &sockAddr[], int nameLen);
+int send(int s, uchar &buf[], int len, int flags);
+int recv(int s, uchar &buf[], int len, int flags);
+ushort htons(ushort hostshort);
+uint inet_addr(string cp);
+int WSAGetLastError();
+int ioctlsocket(int s, long cmd, int &argp);
+#import
+
+//--- Import kernel32.dll for CopyMemory
+#import "kernel32.dll"
+void CopyMemory(int &destination[], int &source[], int length);
+void CopyMemory(uchar &destination[], string source, int length);
+void CopyMemory(uchar &dest[], const string src, int n); // For StringToCharArray alternative if needed
+void ZeroMemory(int &block[], int size); // For sockaddr_in_DLL
+void ZeroMemory(char &block[], int size); // For sockaddr_in_DLL.sin_zero
+#import
+
+// Define sockaddr_in structure (16 bytes)
+struct sockaddr_in_DLL
+{
+  short  sin_family;
+  ushort sin_port;
+  uint   sin_addr;
+  char   sin_zero[8];
+};
 
 //--- Input parameters
 input string ServerAddress = "metaapi.gametrader.my";
 input int ServerPort = 3000;
-input string AccountIdentifier = "SenderAccount123"; // To identify this sender account on the server
+input string AccountIdentifier = "SenderAccount123";
 
 //--- Global variables
 int ExtSocketHandle = INVALID_SOCKET;
 bool ExtIsConnected = false;
+bool ExtIdentified = false;
 datetime ExtLastHeartbeatSent = 0;
-int ExtHeartbeatInterval = 30; // Seconds
+int ExtHeartbeatInterval = 30;       // Seconds
+
+struct KnownOrderState {
+    int    ticket;
+    double sl;
+    double tp;
+    double lots;
+    int    type;
+    string symbol;
+};
+KnownOrderState ExtKnownOpenOrders[200];
+int ExtKnownOpenOrdersCount = 0;
+int ExtLastHistoryTotal = 0;
+datetime ExtLastOnTickProcessedTime = 0;
+
+string EscapeJsonString(string text) {
+    string result = "";
+    int len = StringLen(text);
+    for (int i = 0; i < len; i++) {
+        char ch = StringGetCharacter(text, i);
+        switch (ch) {
+            case '\\': result += "\\\\"; break;
+            case '"':  result += "\\\""; break;
+            case '\b': result += "\\b"; break;
+            case '\f': result += "\\f"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default:
+                if (ch < 32) {
+                    string temp;
+                    StringAppend(temp, "\\u"); // MQL4 doesn't have direct uXXXX, this is illustrative
+                                             // For actual control chars, might need specific handling or ignore
+                    int h1 = ch / 16;
+                    int h2 = ch % 16;
+                    StringAppend(temp, h1<10? (string)h1 : CharToStr((char)('A'+h1-10)) );
+                    StringAppend(temp, h2<10? (string)h2 : CharToStr((char)('A'+h2-10)) );
+                    // This is a simplified hex, proper \\uXXXX needs 4 hex digits.
+                    // For MQL4 JSON, often best to avoid complex control chars or filter them.
+                    // For now, just pass through if not one of the common escapes.
+                    result += CharToStr(ch);
+
+                } else {
+                    result += CharToStr(ch);
+                }
+        }
+    }
+    return result;
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
-int OnInit()
-{
-    //--- Initialize WinSock
-    int error;
-    WORD wVersionRequested = MAKEWORD(2, 2);
-    WSADATA wsaData;
-    error = WSAStartup(wVersionRequested, wsaData);
-    if (error != 0)
-    {
-        Print("WSAStartup failed with error: ", error);
+int OnInit() {
+    int wsaData[WSADATA_SIZE_IN_INTS];
+    ushort wVersionRequired = 0x0202;
+    int error = WSAStartup(wVersionRequested, wsaData);
+    if (error != 0) {
+        Print("SenderEA: WSAStartup failed with error: ", error, " (WSAGetLastError: ", WSAGetLastError(), ")");
         return(INIT_FAILED);
     }
 
-    if (!ConnectToServer())
-    {
-        Print("Failed to connect to server during OnInit.");
-        // Optionally, you might want to allow the EA to keep trying in OnTick or a timer
-        // For now, we'll fail initialization if the first attempt fails.
-        WSACleanup();
-        return(INIT_FAILED);
-    }
-
-    //--- Set a timer to send heartbeats
-    EventSetTimer(ExtHeartbeatInterval);
-
-    Print("Sender EA initialized and connected to ", ServerAddress, ":", ServerPort);
+    EventSetTimer(1);
+    Print("SenderEA: Initialized. AccountIdentifier: ", AccountIdentifier);
+    ExtLastOnTickProcessedTime = 0;
+    ArrayResize(ExtKnownOpenOrders, 200);
     return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
 //| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
-void OnDeinit(const int reason)
-{
-    //--- Kill the timer
+void OnDeinit(const int reason) {
     EventKillTimer();
-
-    if (ExtSocketHandle != INVALID_SOCKET)
-    {
-        Print("Closing socket connection...");
-        SocketClose(ExtSocketHandle);
+    if (ExtSocketHandle != INVALID_SOCKET) {
+        Print("SenderEA: Closing socket connection (", ExtSocketHandle, ")");
+        closesocket(ExtSocketHandle);
         ExtSocketHandle = INVALID_SOCKET;
     }
     ExtIsConnected = false;
+    ExtIdentified = false;
     WSACleanup();
-    Print("Sender EA deinitialized. Reason: ", reason);
+    Print("SenderEA: Deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
-//| Timer function to send heartbeats                                |
+//| Timer function (for heartbeats and connection management)        |
 //+------------------------------------------------------------------+
-void OnTimer()
-{
-    if (!ExtIsConnected)
-    {
-        Print("Timer: Not connected. Attempting to reconnect...");
-        if (!ConnectToServer())
-        {
-            Print("Timer: Reconnect attempt failed.");
+void OnTimer() {
+    if (!ExtIsConnected || ExtSocketHandle == INVALID_SOCKET) {
+        if (ConnectToServer()) {
+            Print("SenderEA Timer: Connection attempt successful/in progress.");
+        } else {
             return;
         }
-        Print("Timer: Reconnected successfully.");
     }
 
-    // Send heartbeat
-    string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + AccountIdentifier + "\",\"timestamp\":" + (string)TimeCurrent() + "}";
-    if (SocketSend(ExtSocketHandle, heartbeatMsg + "\n", StringLen(heartbeatMsg + "\n")) <= 0) // Adding newline as a simple delimiter
-    {
-        Print("Failed to send heartbeat. Error: ", GetLastError());
-        SocketClose(ExtSocketHandle);
-        ExtSocketHandle = INVALID_SOCKET;
-        ExtIsConnected = false;
+    if (ExtIsConnected && ExtSocketHandle != INVALID_SOCKET && !ExtIdentified) {
+        if (SendIdentification()) {
+            ExtIdentified = true;
+            Print("SenderEA Timer: Identification successful. Initializing order states.");
+            InitializeOrderStates();
+        } else {
+            return;
+        }
     }
-    else
-    {
-        //Print("Heartbeat sent to server.");
-        ExtLastHeartbeatSent = TimeCurrent();
+
+    if (ExtIsConnected && ExtSocketHandle != INVALID_SOCKET && ExtIdentified && (TimeCurrent() - ExtLastHeartbeatSent >= ExtHeartbeatInterval)) {
+        string currentSenderAccountId = AccountIdentifier;
+        string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + currentSenderAccountId + "\",\"timestamp\":" + (string)TimeCurrent() + "}";
+        uchar sendBuffer[];
+        StringToCharArray(heartbeatMsg + "\n", sendBuffer, 0, -1, CP_UTF8);
+        int len = ArraySize(sendBuffer) -1;
+
+        if (len > 0 && send(ExtSocketHandle, sendBuffer, len, 0) <= 0) {
+            Print("SenderEA: Failed to send heartbeat to account '",currentSenderAccountId,"'. Error: ", WSAGetLastError());
+            closesocket(ExtSocketHandle);
+            ExtSocketHandle = INVALID_SOCKET;
+            ExtIsConnected = false;
+            ExtIdentified = false;
+            ExtLastOnTickProcessedTime = 0;
+        } else if (len > 0) {
+            ExtLastHeartbeatSent = TimeCurrent();
+        }
     }
 }
-
 
 //+------------------------------------------------------------------+
 //| Connect to server function                                       |
 //+------------------------------------------------------------------+
-bool ConnectToServer()
-{
-    if (ExtIsConnected && ExtSocketHandle != INVALID_SOCKET)
-    {
-        Print("Already connected.");
+bool ConnectToServer() {
+    if (ExtIsConnected && ExtSocketHandle != INVALID_SOCKET && ExtIdentified) {
         return true;
     }
+    if(ExtSocketHandle != INVALID_SOCKET) {
+        closesocket(ExtSocketHandle);
+        ExtSocketHandle = INVALID_SOCKET;
+    }
+    ExtIsConnected = false;
+    ExtIdentified = false;
 
-    ExtSocketHandle = SocketCreate();
-    if (ExtSocketHandle == INVALID_SOCKET)
-    {
-        Print("Failed to create socket. Error: ", GetLastError());
+    ExtSocketHandle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ExtSocketHandle == INVALID_SOCKET) {
+        Print("SenderEA: Failed to create socket. Error: ", WSAGetLastError());
         return false;
     }
 
-    if (!SocketConnect(ExtSocketHandle, ServerAddress, ServerPort, 10000)) // 10 seconds timeout
-    {
-        Print("Failed to connect to server ", ServerAddress, ":", ServerPort, ". Error: ", GetLastError());
-        SocketClose(ExtSocketHandle);
+    int nonBlocking = 1;
+    int argp = nonBlocking;
+    if (ioctlsocket(ExtSocketHandle, FIONBIO, argp) != 0) {
+       Print("SenderEA: ioctlsocket failed to set non-blocking. Error: ", WSAGetLastError());
+       closesocket(ExtSocketHandle);
+       ExtSocketHandle = INVALID_SOCKET;
+       return false;
+    }
+
+    sockaddr_in_DLL serverAddrStructLocal; // Use a local variable
+    // ZeroMemory for struct needs to be careful with MQL4 types
+    // For a struct, it's safer to initialize members directly or use a helper
+    int serverAddr_int[sizeof(sockaddr_in_DLL)/sizeof(int)];
+    ZeroMemory(serverAddr_int, sizeof(sockaddr_in_DLL)); // Zero out the int array
+
+    serverAddrStructLocal.sin_family = AF_INET;
+    serverAddrStructLocal.sin_port = htons(ServerPort);
+    serverAddrStructLocal.sin_addr = inet_addr(ServerAddress);
+
+    if (serverAddrStructLocal.sin_addr == 0xFFFFFFFF || serverAddrStructLocal.sin_addr == 0) {
+        Print("SenderEA: inet_addr failed for ServerAddress: ", ServerAddress,". Please use a valid IPv4 address.");
+        closesocket(ExtSocketHandle);
         ExtSocketHandle = INVALID_SOCKET;
         return false;
+    }
+
+    CopyMemory(serverAddr_int, serverAddrStructLocal, sizeof(sockaddr_in_DLL));
+
+    int connectResult = connect(ExtSocketHandle, serverAddr_int, sizeof(sockaddr_in_DLL));
+
+    if (connectResult == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+             Print("SenderEA: Failed to connect to server ", ServerAddress, ":", ServerPort, ". Error: ", err);
+             closesocket(ExtSocketHandle);
+             ExtSocketHandle = INVALID_SOCKET;
+             return false;
+        }
+        Print("SenderEA: Connection attempt in progress (non-blocking) to ", ServerAddress, ":", ServerPort, ". Error code (if any): ", err);
+    } else {
+         Print("SenderEA: Connect call returned success immediately.");
     }
 
     ExtIsConnected = true;
-    Print("Successfully connected to server: ", ServerAddress, ":", ServerPort);
-
-    // Send an initial identification message
-    string identMsg = "{\"type\":\"identification\",\"role\":\"sender\",\"accountId\":\"" + AccountIdentifier + "\"}";
-    if (SocketSend(ExtSocketHandle, identMsg + "\n", StringLen(identMsg + "\n")) <= 0)
-    {
-        Print("Failed to send identification message. Error: ", GetLastError());
-        SocketClose(ExtSocketHandle);
-        ExtSocketHandle = INVALID_SOCKET;
-        ExtIsConnected = false;
-        return false;
-    }
-    Print("Identification message sent.");
-    ExtLastHeartbeatSent = TimeCurrent(); // Initialize heartbeat timer
     return true;
 }
 
-// Structure to store order state for detecting modifications
-struct KnownOrderState {
-    int ticket;
-    double sl;
-    double tp;
-    double lots; // To detect partial closes if they reflect on OrderLots()
-};
-KnownOrderState ExtKnownOpenOrders[100]; // Max 100 open orders tracked, adjust if needed
-int ExtKnownOpenOrdersCount = 0;
-int ExtLastOrdersTotal = 0;       // To detect new/closed orders by count
-int ExtLastHistoryTotal = 0;      // To detect closed orders from history pool
-datetime ExtLastOnTickProcessedTime = 0; // To prevent processing too frequently if OnTick is rapid
+//+------------------------------------------------------------------+
+//| Send Identification Message                                      |
+//+------------------------------------------------------------------+
+bool SendIdentification() {
+    if (ExtSocketHandle == INVALID_SOCKET || !ExtIsConnected) {
+         Print("SenderEA: Cannot send identification, socket not valid or connection not initiated.");
+         return false;
+    }
+
+    string identMsg = "{\"type\":\"identification\",\"role\":\"sender\",\"accountId\":\"" + AccountIdentifier + "\"}";
+    uchar sendBufferIdent[];
+    StringToCharArray(identMsg + "\n", sendBufferIdent, 0, -1, CP_UTF8);
+    int identLen = ArraySize(sendBufferIdent) -1;
+
+    if (identLen <=0) {
+        Print("SenderEA: Identification message is empty.");
+        return false;
+    }
+
+    int sentBytes = send(ExtSocketHandle, sendBufferIdent, identLen, 0);
+    if (sentBytes <= 0) {
+        int sendError = WSAGetLastError();
+        Print("SenderEA: Failed to send identification message. Error: ", sendError);
+        if (sendError != WSAEWOULDBLOCK && sendError != WSAENOTCONN && sendError != WSAECONNABORTED) {
+            closesocket(ExtSocketHandle);
+            ExtSocketHandle = INVALID_SOCKET;
+            ExtIsConnected = false;
+            ExtIdentified = false;
+            return false;
+        }
+        Print("SenderEA: Identification send pending (Error: ",sendError,"), connection likely not fully established yet.");
+        return false;
+    }
+    Print("SenderEA: Identification message appears sent (or queued by OS).");
+    ExtLastHeartbeatSent = TimeCurrent();
+    return true;
+}
 
 //+------------------------------------------------------------------+
 //| Initialize order states                                          |
 //+------------------------------------------------------------------+
 void InitializeOrderStates() {
     ExtKnownOpenOrdersCount = 0;
-    for (int i = 0; i < OrdersTotal(); i++) {
+    // ArrayResize(ExtKnownOpenOrders, 200); // Already sized
+
+    for (int i = OrdersTotal() - 1; i >= 0; i--) {
         if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
-            if (OrderMagicNumber() == 0 || AccountInfoInteger(ACCOUNT_LOGIN) == OrderMagicNumber()) { // Optional: Filter by current EA's magic or all manual trades
-                if (ExtKnownOpenOrdersCount < ArraySize(ExtKnownOpenOrders)) {
-                    ExtKnownOpenOrders[ExtKnownOpenOrdersCount].ticket = OrderTicket();
-                    ExtKnownOpenOrders[ExtKnownOpenOrdersCount].sl = OrderStopLoss();
-                    ExtKnownOpenOrders[ExtKnownOpenOrdersCount].tp = OrderTakeProfit();
-                    ExtKnownOpenOrders[ExtKnownOpenOrdersCount].lots = OrderLots();
-                    ExtKnownOpenOrdersCount++;
-                }
+            if (ExtKnownOpenOrdersCount < ArraySize(ExtKnownOpenOrders)) {
+                ExtKnownOpenOrders[ExtKnownOpenOrdersCount].ticket = OrderTicket();
+                ExtKnownOpenOrders[ExtKnownOpenOrdersCount].sl = OrderStopLoss();
+                ExtKnownOpenOrders[ExtKnownOpenOrdersCount].tp = OrderTakeProfit();
+                ExtKnownOpenOrders[ExtKnownOpenOrdersCount].lots = OrderLots();
+                ExtKnownOpenOrders[ExtKnownOpenOrdersCount].type = OrderType();
+                ExtKnownOpenOrders[ExtKnownOpenOrdersCount].symbol = OrderSymbol();
+                ExtKnownOpenOrdersCount++;
+            } else {
+                Print("SenderEA: InitializeOrderStates: Known open orders array is full. Max: ", ArraySize(ExtKnownOpenOrders));
+                break;
             }
         }
     }
-    ExtLastOrdersTotal = OrdersTotal();
     ExtLastHistoryTotal = HistoryTotal();
-    Print("Initial order states captured. Open orders tracked: ", ExtKnownOpenOrdersCount);
+    Print("SenderEA: Initial order states captured. Open orders tracked: ", ExtKnownOpenOrdersCount, ". HistoryTotal: ", ExtLastHistoryTotal);
+    ExtLastOnTickProcessedTime = TimeCurrent();
 }
 
 
@@ -191,157 +357,149 @@ void InitializeOrderStates() {
 //| OnTick function (primary place for MQL4 trade detection)         |
 //+------------------------------------------------------------------+
 void OnTick() {
-    //--- Ensure connected
-    if (!ExtIsConnected) {
-        if (ConnectToServer()) {
-            Print("OnTick: Reconnected successfully. Initializing order states.");
-            InitializeOrderStates(); // Re-initialize states after reconnect
-        } else {
-            return; // Not connected, nothing to do
-        }
+    if (!ExtIsConnected || ExtSocketHandle == INVALID_SOCKET || !ExtIdentified) {
+        ExtLastOnTickProcessedTime = 0;
+        return;
     }
 
-    // Initialize states on first successful tick if not already done (e.g. after EA start/reconnect)
-    if (ExtLastOnTickProcessedTime == 0 && ExtIsConnected) {
+    if (ExtLastOnTickProcessedTime == 0) {
          InitializeOrderStates();
+         if(ExtKnownOpenOrdersCount == 0 && OrdersTotal() == 0 && HistoryTotal() == ExtLastHistoryTotal) {
+             ExtLastOnTickProcessedTime = TimeCurrent();
+         }
+         // If still 0 after init, means init didn't complete or no orders
+         if(ExtLastOnTickProcessedTime == 0) return;
     }
-    ExtLastOnTickProcessedTime = TimeCurrent();
-
 
     // --- Detect Closed Orders by iterating history ---
-    // This is more reliable for detecting any type of close (manual, SL, TP)
     if (HistoryTotal() > ExtLastHistoryTotal) {
         for (int i = ExtLastHistoryTotal; i < HistoryTotal(); i++) {
             if (OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) {
-                // Check if it's a closed trade relevant to us (e.g. by magic number or if we track all)
-                // And ensure it's actually a position closure (not balance operation etc.)
-                if (OrderType() == OP_BUY || OrderType() == OP_SELL) { // Only actual buy/sell orders
-                    // We need to confirm this order was previously open and known to us,
-                    // or assume any new history item is a close to be reported.
-                    // A simple way: if an order appears in history, it was closed or partially closed.
-                    // The ReceiverEA expects "DEAL_ENTRY_OUT" for closes.
-                    // We also need to provide the original order details as best as possible.
-                    // The "order" object in the JSON should reflect the state *before* closing if possible,
-                    // or at least its identifying characteristics.
+                if (OrderType() == OP_BUY || OrderType() == OP_SELL) {
+                    int knownIndex = FindKnownOrderIndex(OrderTicket());
+                    if (knownIndex != -1) {
+                        string orderSymbol = OrderSymbol();
+                        int symDigits = MarketInfo(orderSymbol, MODE_DIGITS);
 
-                    // Construct JSON for a closed order
-                    string orderJson = "{";
-                    orderJson += "\"ticket\":" + (string)OrderTicket() + ",";
-                    orderJson += "\"symbol\":\"" + OrderSymbol() + "\",";
-                    orderJson += "\"type\":" + (string)OrderType() + ",";
-                    orderJson += "\"lots\":" + DoubleToString(OrderLots(), OrderDigits()) + ","; // Original lots
-                    orderJson += "\"openPrice\":" + DoubleToString(OrderOpenPrice(), OrderDigits()) + ",";
-                    orderJson += "\"openTime\":\"" + TimeToString(OrderOpenTime(), TIME_DATE|TIME_SECONDS) + "\",";
-                    orderJson += "\"stopLoss\":" + DoubleToString(OrderStopLoss(), OrderDigits()) + ","; // SL at time of close
-                    orderJson += "\"takeProfit\":" + DoubleToString(OrderTakeProfit(), OrderDigits()) + ","; // TP at time of close
-                    orderJson += "\"closePrice\":" + DoubleToString(OrderClosePrice(), OrderDigits()) + ",";
-                    orderJson += "\"closeTime\":\"" + TimeToString(OrderCloseTime(), TIME_DATE|TIME_SECONDS) + "\",";
-                    orderJson += "\"commission\":" + DoubleToString(OrderCommission(), 2) + ",";
-                    orderJson += "\"swap\":" + DoubleToString(OrderSwap(), 2) + ",";
-                    orderJson += "\"profit\":" + DoubleToString(OrderProfit(), 2) + ",";
-                    orderJson += "\"comment\":\"" + StringSubst(OrderComment(),"\"","\\\"") + "\",";
-                    orderJson += "\"magicNumber\":" + (string)OrderMagicNumber();
-                    orderJson += "}";
+                        string orderJson = "{";
+                        orderJson += "\"ticket\":" + (string)OrderTicket() + ",";
+                        orderJson += "\"symbol\":\"" + EscapeJsonString(orderSymbol) + "\",";
+                        orderJson += "\"type\":" + (string)OrderType() + ",";
+                        orderJson += "\"lots\":" + DoubleToString(OrderLots(), symDigits) + ",";
+                        orderJson += "\"openPrice\":" + DoubleToString(OrderOpenPrice(), symDigits) + ",";
+                        orderJson += "\"openTime\":\"" + TimeToString(OrderOpenTime(), TIME_DATE|TIME_SECONDS) + "\",";
+                        orderJson += "\"stopLoss\":" + DoubleToString(OrderStopLoss(), symDigits) + ",";
+                        orderJson += "\"takeProfit\":" + DoubleToString(OrderTakeProfit(), symDigits) + ",";
+                        orderJson += "\"closePrice\":" + DoubleToString(OrderClosePrice(), symDigits) + ",";
+                        orderJson += "\"closeTime\":\"" + TimeToString(OrderCloseTime(), TIME_DATE|TIME_SECONDS) + "\",";
+                        orderJson += "\"commission\":" + DoubleToString(OrderCommission(), 2) + ",";
+                        orderJson += "\"swap\":" + DoubleToString(OrderSwap(), 2) + ",";
+                        orderJson += "\"profit\":" + DoubleToString(OrderProfit(), 2) + ",";
+                        orderJson += "\"comment\":\"" + EscapeJsonString(OrderComment()) + "\",";
+                        orderJson += "\"magicNumber\":" + (string)OrderMagicNumber();
+                        orderJson += "}";
 
-                    string dealJson = "{";
-                    dealJson += "\"order\":" + (string)OrderTicket() + ","; // Link to the order ticket that was closed
-                    dealJson += "\"entry\":\"DEAL_ENTRY_OUT\","; // Simulate MQL5 deal entry type for close
-                    dealJson += "\"lots\":" + DoubleToString(OrderLots(), OrderDigits()) + ""; // Lots closed (assuming full close here)
-                    // Add more deal fields if receiver needs them, like deal ticket (can be same as order ticket for MQL4 context)
-                    // dealJson += ", \"price\":" + DoubleToString(OrderClosePrice(), OrderDigits());
-                    // dealJson += ", \"time\":\"" + TimeToString(OrderCloseTime(), TIME_DATE|TIME_SECONDS) + "\"";
-                    dealJson += "}";
+                        string dealJson = "{";
+                        dealJson += "\"order\":" + (string)OrderTicket() + ",";
+                        dealJson += "\"entry\":\"DEAL_ENTRY_OUT\",";
+                        dealJson += "\"lots\":" + DoubleToString(OrderLots(), symDigits) + "";
+                        dealJson += "}";
 
-                    SendTradeEvent("TRADE_TRANSACTION_DEAL", orderJson, dealJson);
-
-                    // Remove from known open orders if it was there
-                    RemoveKnownOrder(OrderTicket());
+                        SendTradeEvent("TRADE_TRANSACTION_DEAL", orderJson, dealJson);
+                        RemoveKnownOrder(OrderTicket());
+                    }
                 }
             }
         }
     }
     ExtLastHistoryTotal = HistoryTotal();
 
-
     // --- Detect New Orders & Modifications for currently open orders ---
-    bool knownOrdersUpdated[100]; // Max 100
-    for(int k=0; k < ExtKnownOpenOrdersCount; k++) knownOrdersUpdated[k] = false;
+    bool currentKnownOrderFound[200];
+    if(ArraySize(ExtKnownOpenOrders) > 0) ArrayInitialize(currentKnownOrderFound, false);
 
-    int currentOpenOrderCount = 0;
     for (int i = 0; i < OrdersTotal(); i++) {
         if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
-            currentOpenOrderCount++;
-            // Optional: Filter by magic number if you only want to send trades from this EA or manual trades
-            // if (OrderMagicNumber() != 0 && OrderMagicNumber() != SomeSpecificMagicNumber) continue;
+            int orderTicket = OrderTicket();
+            string orderSymbol = OrderSymbol();
+            int symDigits = MarketInfo(orderSymbol, MODE_DIGITS);
+            double symPoint = MarketInfo(orderSymbol, MODE_POINT);
 
-            int knownIndex = FindKnownOrderIndex(OrderTicket());
+            double currentSL = OrderStopLoss();
+            double currentTP = OrderTakeProfit();
+            double currentLots = OrderLots();
+            int orderType = OrderType();
+
+            int knownIndex = FindKnownOrderIndex(orderTicket);
+
             string orderJson = "{";
-            orderJson += "\"ticket\":" + (string)OrderTicket() + ",";
-            orderJson += "\"symbol\":\"" + OrderSymbol() + "\",";
-            orderJson += "\"type\":" + (string)OrderType() + ",";
-            orderJson += "\"lots\":" + DoubleToString(OrderLots(), OrderDigits()) + ",";
-            orderJson += "\"openPrice\":" + DoubleToString(OrderOpenPrice(), OrderDigits()) + ",";
+            orderJson += "\"ticket\":" + (string)orderTicket + ",";
+            orderJson += "\"symbol\":\"" + EscapeJsonString(orderSymbol) + "\",";
+            orderJson += "\"type\":" + (string)orderType + ",";
+            orderJson += "\"lots\":" + DoubleToString(currentLots, symDigits) + ",";
+            orderJson += "\"openPrice\":" + DoubleToString(OrderOpenPrice(), symDigits) + ",";
             orderJson += "\"openTime\":\"" + TimeToString(OrderOpenTime(), TIME_DATE|TIME_SECONDS) + "\",";
-            orderJson += "\"stopLoss\":" + DoubleToString(OrderStopLoss(), OrderDigits()) + ",";
-            orderJson += "\"takeProfit\":" + DoubleToString(OrderTakeProfit(), OrderDigits()) + ",";
-            orderJson += "\"closePrice\":0,"; // Not closed
-            orderJson += "\"closeTime\":0,";  // Not closed
+            orderJson += "\"stopLoss\":" + DoubleToString(currentSL, symDigits) + ",";
+            orderJson += "\"takeProfit\":" + DoubleToString(currentTP, symDigits) + ",";
+            orderJson += "\"closePrice\":0,";
+            orderJson += "\"closeTime\":0,";
             orderJson += "\"commission\":" + DoubleToString(OrderCommission(), 2) + ",";
             orderJson += "\"swap\":" + DoubleToString(OrderSwap(), 2) + ",";
-            orderJson += "\"profit\":" + DoubleToString(OrderProfit(), 2) + ","; // Current floating profit
-            orderJson += "\"comment\":\"" + StringSubst(OrderComment(),"\"","\\\"") + "\",";
+            orderJson += "\"profit\":" + DoubleToString(OrderProfit(), 2) + ",";
+            orderJson += "\"comment\":\"" + EscapeJsonString(OrderComment()) + "\",";
             orderJson += "\"magicNumber\":" + (string)OrderMagicNumber();
             orderJson += "}";
 
-            if (knownIndex == -1) { // New order
+            if (knownIndex == -1) {
                 SendTradeEvent("TRADE_TRANSACTION_ORDER_ADD", orderJson, "null");
-                AddKnownOrder(OrderTicket(), OrderStopLoss(), OrderTakeProfit(), OrderLots());
-            } else { // Existing order, check for modification (SL/TP)
-                knownOrdersUpdated[knownIndex] = true;
-                bool modified = false;
-                if (ExtKnownOpenOrders[knownIndex].sl != OrderStopLoss() ||
-                    ExtKnownOpenOrders[knownIndex].tp != OrderTakeProfit()) {
-                    modified = true;
-                }
-                // Could also check for OrderLots() change for partial close detection if not handled by history
-                // For now, focusing on SL/TP modification for "ORDER_UPDATE"
-
-                if (modified) {
-                    SendTradeEvent("TRADE_TRANSACTION_ORDER_UPDATE", orderJson, "null");
-                    ExtKnownOpenOrders[knownIndex].sl = OrderStopLoss();
-                    ExtKnownOpenOrders[knownIndex].tp = OrderTakeProfit();
-                    ExtKnownOpenOrders[knownIndex].lots = OrderLots(); // Update lots too
-                }
-            }
-        }
-    }
-
-    // If OrdersTotal decreased, or if some known orders were not found in current open pool, they were closed
-    // This is a secondary check for closes, primary is history check.
-    // Clean up ExtKnownOpenOrders for any trades that are no longer open but weren't caught by history scan (e.g. if history scan is offset)
-    for (int k = ExtKnownOpenOrdersCount - 1; k >= 0; k--) {
-        if (!knownOrdersUpdated[k]) { // If it wasn't updated, it might be closed
-            if (OrderSelect(ExtKnownOpenOrders[k].ticket, SELECT_BY_TICKET, MODE_TRADES)) {
-                // Still open, something is wrong with knownOrdersUpdated logic or it's a new order not yet in list
+                AddKnownOrder(orderTicket, currentSL, currentTP, currentLots, orderType, orderSymbol);
+                 if(ExtKnownOpenOrdersCount > 0 && (ExtKnownOpenOrdersCount-1) < ArraySize(currentKnownOrderFound))
+                    currentKnownOrderFound[ExtKnownOpenOrdersCount-1] = true;
             } else {
-                // No longer in MODE_TRADES, so it's closed. History check should have caught it.
-                // This is a fallback cleanup.
-                Print("Order ", ExtKnownOpenOrders[k].ticket, " no longer open (fallback detection). Removing from known list.");
-                RemoveKnownOrderFromArray(k);
+                if(knownIndex < ArraySize(currentKnownOrderFound)) currentKnownOrderFound[knownIndex] = true;
+
+                bool slTpModified = false;
+                if (MathAbs(ExtKnownOpenOrders[knownIndex].sl - currentSL) > symPoint * 0.1 ||
+                    MathAbs(ExtKnownOpenOrders[knownIndex].tp - currentTP) > symPoint * 0.1 ) {
+                    if (! (ExtKnownOpenOrders[knownIndex].sl == 0 && currentSL == 0 && ExtKnownOpenOrders[knownIndex].tp == 0 && currentTP == 0) ) {
+                         slTpModified = true;
+                    }
+                }
+
+                bool lotsModified = (MathAbs(ExtKnownOpenOrders[knownIndex].lots - currentLots) > 0.0000001);
+
+                if (slTpModified || lotsModified) {
+                    Print("SenderEA: Modification detected for ticket ", orderTicket, ": Old SL=", ExtKnownOpenOrders[knownIndex].sl, ", New SL=", currentSL,
+                          ", Old TP=", ExtKnownOpenOrders[knownIndex].tp, ", New TP=", currentTP,
+                          ", Old Lots=", ExtKnownOpenOrders[knownIndex].lots, ", New Lots=", currentLots);
+                    SendTradeEvent("TRADE_TRANSACTION_ORDER_UPDATE", orderJson, "null");
+                    ExtKnownOpenOrders[knownIndex].sl = currentSL;
+                    ExtKnownOpenOrders[knownIndex].tp = currentTP;
+                    ExtKnownOpenOrders[knownIndex].lots = currentLots;
+                }
             }
         }
     }
 
-    ExtLastOrdersTotal = currentOpenOrderCount; // Update to current actual open orders
+    for (int k = ExtKnownOpenOrdersCount - 1; k >= 0; k--) {
+        if (k < ArraySize(currentKnownOrderFound) && !currentKnownOrderFound[k]) {
+            // This order was in ExtKnownOpenOrders but was not found in the current OrdersTotal() scan.
+            // It implies the order was closed. The history check should ideally capture this.
+            // This is a fallback to remove it from the known list.
+            // To avoid sending duplicate close events, we rely on history check to send the actual event.
+            Print("SenderEA: Order ", ExtKnownOpenOrders[k].ticket, " (Symbol: ", ExtKnownOpenOrders[k].symbol,
+                  ") from known list not found in current open orders scan. Removing from known list.");
+            RemoveKnownOrderFromArray(k);
+        }
+    }
 }
-
 
 //+------------------------------------------------------------------+
 //| Send Trade Event to Server                                       |
 //+------------------------------------------------------------------+
 void SendTradeEvent(string transactionType, string orderJson, string dealJson) {
-    if (!ExtIsConnected) {
-        Print("Not connected, cannot send trade event.");
+    if (!ExtIsConnected || ExtSocketHandle == INVALID_SOCKET || !ExtIdentified) {
+        Print("SenderEA: Not connected or not identified, cannot send trade event '", transactionType, "'");
         return;
     }
 
@@ -349,25 +507,30 @@ void SendTradeEvent(string transactionType, string orderJson, string dealJson) {
     jsonPayload += "\"type\":\"tradeEvent\",";
     jsonPayload += "\"accountId\":\"" + AccountIdentifier + "\",";
     jsonPayload += "\"transactionType\":\"" + transactionType + "\",";
-    jsonPayload += "\"timestamp\":" + (string)TimeCurrent() + ","; // Current server time on MT4
+    jsonPayload += "\"timestamp\":" + (string)TimeCurrent() + ",";
     jsonPayload += "\"order\":" + orderJson + ",";
-    jsonPayload += "\"deal\":" + dealJson;  // dealJson can be "null" if not applicable
-    // Request and Result objects are omitted for MQL4 OnTick implementation simplicity
-    // jsonPayload += ",\"request\":null,";
-    // jsonPayload += "\"result\":null";
+    jsonPayload += "\"deal\":" + dealJson;
     jsonPayload += "}";
 
     string messageToSend = jsonPayload + "\n";
-    Print("Sending event: ", transactionType, " for order details: ", orderJson, " deal details: ", dealJson);
+    Print("SenderEA: Sending event: ", messageToSend);
 
-    if (SocketSend(ExtSocketHandle, messageToSend, StringLen(messageToSend)) <= 0) {
-        Print("Failed to send trade event. Error: ", GetLastError());
-        SocketClose(ExtSocketHandle);
+    uchar sendBuffer[];
+    StringToCharArray(messageToSend, sendBuffer, 0, -1, CP_UTF8);
+    int len = ArraySize(sendBuffer) -1;
+
+    if (len <= 0) {
+        Print("SenderEA: Cannot send empty message for event ", transactionType);
+        return;
+    }
+
+    if (send(ExtSocketHandle, sendBuffer, len, 0) <= 0) {
+        Print("SenderEA: Failed to send trade event '", transactionType, "'. Error: ", WSAGetLastError());
+        closesocket(ExtSocketHandle);
         ExtSocketHandle = INVALID_SOCKET;
         ExtIsConnected = false;
-        ExtLastOnTickProcessedTime = 0; // Reset to re-init states on next connect
-    } else {
-        // Print("Trade event sent successfully.");
+        ExtIdentified = false;
+        ExtLastOnTickProcessedTime = 0;
     }
 }
 
@@ -381,55 +544,85 @@ int FindKnownOrderIndex(int ticket) {
     return -1;
 }
 
-void AddKnownOrder(int ticket, double sl, double tp, double lots) {
+void AddKnownOrder(int ticket, double sl, double tp, double lots, int orderTypeVal, string symbolStr) {
     if (ExtKnownOpenOrdersCount < ArraySize(ExtKnownOpenOrders)) {
-        if (FindKnownOrderIndex(ticket) == -1) { // Ensure not already added
+        if (FindKnownOrderIndex(ticket) == -1) {
             ExtKnownOpenOrders[ExtKnownOpenOrdersCount].ticket = ticket;
             ExtKnownOpenOrders[ExtKnownOpenOrdersCount].sl = sl;
             ExtKnownOpenOrders[ExtKnownOpenOrdersCount].tp = tp;
             ExtKnownOpenOrders[ExtKnownOpenOrdersCount].lots = lots;
+            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].type = orderTypeVal;
+            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].symbol = symbolStr;
             ExtKnownOpenOrdersCount++;
-            Print("Added to known orders: ", ticket);
+            Print("SenderEA: Added to known orders: #", ticket, " ", symbolStr, " Type:", EnumToString(orderTypeVal), " Lots:", lots, " SL:", sl, " TP:",tp);
         }
     } else {
-        Print("Known open orders array is full. Cannot add ticket: ", ticket);
+        Print("SenderEA: Known open orders array is full. Cannot add ticket: ", ticket);
     }
 }
 
-void RemoveKnownOrderFromArray(int index) { // Removes by array index
+void RemoveKnownOrderFromArray(int index) {
     if (index < 0 || index >= ExtKnownOpenOrdersCount) return;
-    Print("Removing from known orders by index ", index, ", ticket ", ExtKnownOpenOrders[index].ticket);
+    Print("SenderEA: Removing from known orders by index ", index, ", ticket ", ExtKnownOpenOrders[index].ticket);
     for (int i = index; i < ExtKnownOpenOrdersCount - 1; i++) {
         ExtKnownOpenOrders[i] = ExtKnownOpenOrders[i+1];
     }
-    ExtKnownOpenOrdersCount--;
+    if (ExtKnownOpenOrdersCount > 0) ExtKnownOpenOrdersCount--;
 }
 
-void RemoveKnownOrder(int ticket) { // Removes by ticket number
+void RemoveKnownOrder(int ticket) {
     int index = FindKnownOrderIndex(ticket);
     if (index != -1) {
         RemoveKnownOrderFromArray(index);
     }
 }
 
-// Helper to escape quotes in strings for JSON (simplified)
-string StringSubst(string text, string find, string replace) {
+string StringSubst(string text, string findStr, string replaceStr) {
     string result = text;
-    int findLen = StringLen(find);
-    if (findLen == 0) return text; // Avoid infinite loop if find is empty
-    int replaceLen = StringLen(replace);
-    int pos = StringFind(result, find, 0);
+    if (StringLen(findStr) == 0) return text;
+
+    int findLen = StringLen(findStr);
+    int replaceLen = StringLen(replaceStr);
+    int pos = StringFind(result, findStr, 0);
+
     while (pos != -1) {
-        result = StringSubstr(result, 0, pos) + replace + StringSubstr(result, pos + findLen);
-        pos = StringFind(result, find, pos + replaceLen);
+        string part1 = StringSubstr(result, 0, pos);
+        string part2 = StringSubstr(result, pos + findLen);
+        result = part1 + replaceStr + part2;
+        pos = StringFind(result, findStr, pos + replaceLen);
     }
     return result;
 }
 
-// EnumToString is not needed if we manually set transactionType strings.
-/*
 string EnumToString(int enum_value) {
-    return IntegerToString(enum_value);
+    switch(enum_value) {
+        case OP_BUY: return "OP_BUY";
+        case OP_SELL: return "OP_SELL";
+        case OP_BUYLIMIT: return "OP_BUYLIMIT";
+        case OP_SELLLIMIT: return "OP_SELLLIMIT";
+        case OP_BUYSTOP: return "OP_BUYSTOP";
+        case OP_SELLSTOP: return "OP_SELLSTOP";
+        default: return "UNKNOWN_ORDER_TYPE_" + IntegerToString(enum_value);
+    }
 }
-*/
-}
+//+------------------------------------------------------------------+
+```
+
+I have made the following changes in this full version:
+-   **Commented out `#include <WinSock2.mqh>`:** And defined necessary constants (`AF_INET`, `SOCK_STREAM`, `IPPROTO_TCP`, `INVALID_SOCKET`, `SOCKET_ERROR`, `FIONBIO`, `WSAEWOULDBLOCK`, etc.) directly in the file. This should resolve the "can't open include file" error if `WinSock2.mqh` is missing or problematic in your environment.
+-   **Corrected DLL Import Signatures:**
+    *   `send` and `recv`: Changed buffer parameter to `uchar &buf[]` to correctly pass by reference for modification.
+    *   `connect`: Changed `sockaddr` parameter to `int &sockAddr[]` to reflect passing the structure as an integer array by reference.
+    *   `WSAStartup`: `WSAData` parameter is `int &WSAData[]`.
+    *   `ioctlsocket`: `argp` is `int &argp`.
+-   **`CopyMemory` Imports:** Added necessary imports for `CopyMemory` from `kernel32.dll` for different use cases (int array to int array, string to uchar array). Added `ZeroMemory` for initializing `sockaddr_in_DLL` via an int array.
+-   **`OrderDigits()` Replacement:** Replaced all instances of `OrderDigits()` with `MarketInfo(OrderSymbol(), MODE_DIGITS)` or simply `Digits` (if `OrderSymbol()` is already available in context).
+-   **Array Initialization:** Ensured `currentKnownOrderFound` array is initialized using `ArrayInitialize(currentKnownOrderFound, false);` before its use in loops.
+-   **`send()` parameters:** Ensured `StringToCharArray` is used to populate the `uchar` buffer and `ArraySize(buffer) - 1` is used for the length to exclude the null terminator. Added `CP_UTF8` for encoding.
+-   **`inet_addr` return type:** Confirmed `uint` for `inet_addr`.
+-   **`sockaddr_in_DLL` Zeroing:** Used `ZeroMemory` on the `int` array version of `sockaddr_in_DLL` before populating it.
+-   **JSON Escaping:** Included the `EscapeJsonString` function and used it for `OrderSymbol()` and `OrderComment()` when building JSON strings to prevent issues with special characters.
+-   **Refined Connection/Identification Logic:** Made the connection and identification attempts primarily driven by `OnTimer` to prevent `OnTick` from being blocked or spamming. `OnTick` now checks if connected and identified before proceeding with trade detection. `InitializeOrderStates` is called after successful identification.
+
+Please replace the entire content of your `SenderEA.mq4` with this code. I am hopeful this will compile successfully and address the previous issues.
+I sincerely apologize for the multiple attempts and the errors. This has highlighted areas I need to improve in handling complex code generation and state.
