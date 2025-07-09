@@ -193,9 +193,10 @@ void ReceiveMessages() {
         message = g_clientSocket.Receive("\n"); // Using newline as the message separator
         if (message != "") {
             // Print("ReceiverEA: Raw message received: '", message, "'"); // Debugging
-            if (StringTrim(message) != "") { // Ensure it's not just whitespace if library returns that
-                 Print("ReceiverEA: Processing message: ", message);
-                 ProcessServerMessage(message);
+            string trimmedMessage = StringTrim(message); // Use the new helper function
+            if (trimmedMessage != "") { // Check the trimmed message
+                 Print("ReceiverEA: Processing message: ", trimmedMessage); // Log the trimmed message
+                 ProcessServerMessage(trimmedMessage); // Process the trimmed message
                  messagesProcessedThisCycle++;
             }
         }
@@ -459,6 +460,13 @@ string GetJsonObjectString(string json, string key) {
 //| OnTick function (remains empty)                                  |
 //+------------------------------------------------------------------+
 void OnTick() {}
+
+//+------------------------------------------------------------------+
+//| Helper function to trim whitespace from both ends of a string    |
+//+------------------------------------------------------------------+
+string StringTrim(string text) {
+    return StringTrimRight(StringTrimLeft(text));
+}
 
 //+------------------------------------------------------------------+
 //| Helper for lot size string formatting (consistent with SenderEA) |
