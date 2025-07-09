@@ -11,7 +11,7 @@
 //--- Include necessary libraries
 #include <WinSock2.mqh> // For socket functions
 #include <stdlib.mqh>   // For StringToDouble, StringToInteger, etc.
-#include <Trade\Trade.mqh> // For CTrade class (MQL5 style, can be helpful but direct functions used for MQL4)
+// #include <Trade\Trade.mqh> // Not used in this version as direct MQL4 functions are employed
 
 //--- Input parameters
 input string ServerAddress = "metaapi.gametrader.my";
