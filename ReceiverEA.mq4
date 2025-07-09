@@ -16,7 +16,7 @@
 //--- Input parameters
 input string ServerAddress = "metaapi.gametrader.my";
 input int ServerPort = 3000;
-input string ReceiverAccountId = "ReceiverAccount456"; // To identify this receiver account on the server
+// input string ReceiverAccountId = "ReceiverAccount456"; // To identify this receiver account on the server - REMOVED, will use AccountNumber()
 input string SenderAccountIdToFollow = "SenderAccount123"; // Which sender account to listen to
 input int MagicNumberReceiver = 12345; // Magic number for trades opened by this EA
 
@@ -96,10 +96,11 @@ void OnTimer()
     //--- Send heartbeat if due
     if (TimeCurrent() - ExtLastHeartbeatSent >= ExtHeartbeatInterval)
     {
-        string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + ReceiverAccountId + "\",\"timestamp\":" + (string)TimeCurrent() + "}";
+        string currentReceiverMT4AccountId = IntegerToString(AccountNumber());
+        string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + currentReceiverMT4AccountId + "\",\"timestamp\":" + (string)TimeCurrent() + "}";
         if (SocketSend(ExtSocketHandle, heartbeatMsg + "\n", StringLen(heartbeatMsg + "\n")) <= 0)
         {
-            Print("Failed to send heartbeat. Error: ", GetLastError());
+            Print("Failed to send heartbeat to account '",currentReceiverMT4AccountId,"'. Error: ", GetLastError());
             SocketClose(ExtSocketHandle); // Assume connection is broken
             ExtSocketHandle = INVALID_SOCKET;
             ExtIsConnected = false;
@@ -157,20 +158,23 @@ bool ConnectToServer()
     Print("Successfully connected to server: ", ServerAddress, ":", ServerPort);
     ExtLastHeartbeatSent = TimeCurrent(); // Initialize heartbeat timer
 
+    // Get the account number for ReceiverAccountId
+    string currentReceiverMT4AccountId = IntegerToString(AccountNumber());
+
     // Send identification message
     string identMsg = "{\"type\":\"identification\",\"role\":\"receiver\"";
-    identMsg += ",\"accountId\":\"" + ReceiverAccountId + "\"";
+    identMsg += ",\"accountId\":\"" + currentReceiverMT4AccountId + "\"";
     identMsg += ",\"listenTo\":\"" + SenderAccountIdToFollow + "\"}";
 
     if (SocketSend(ExtSocketHandle, identMsg + "\n", StringLen(identMsg + "\n")) <= 0)
     {
-        Print("Failed to send identification message. Error: ", GetLastError());
+        Print("Failed to send identification message for account '", currentReceiverMT4AccountId, "'. Error: ", GetLastError());
         SocketClose(ExtSocketHandle);
         ExtSocketHandle = INVALID_SOCKET;
         ExtIsConnected = false;
         return false;
     }
-    Print("Identification message sent: listening to ", SenderAccountIdToFollow);
+    Print("Identification message sent: Receiver Account '", currentReceiverMT4AccountId, "' listening to '", SenderAccountIdToFollow, "'");
     return true;
 }
 
