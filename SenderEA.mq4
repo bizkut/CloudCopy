@@ -62,8 +62,8 @@ string EscapeJsonString(string text) {
                     temp = "\\u00"; // All these are in the 00xx range
                     int h1 = ch / 16;
                     int h2 = ch % 16;
-                    StringAppend(temp, h1 < 10 ? (string)h1 : CharToStr((char)('A' + h1 - 10)));
-                    StringAppend(temp, h2 < 10 ? (string)h2 : CharToStr((char)('A' + h2 - 10)));
+                    temp += (h1 < 10 ? (string)h1 : CharToStr((char)('A' + h1 - 10)));
+                    temp += (h2 < 10 ? (string)h2 : CharToStr((char)('A' + h2 - 10)));
                     result += temp;
                 } else {
                     result += CharToStr(ch); // Regular character
