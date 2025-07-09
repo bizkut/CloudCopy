@@ -150,157 +150,273 @@ bool ConnectToServer()
     return true;
 }
 
+// Structure to store order state for detecting modifications
+struct KnownOrderState {
+    int ticket;
+    double sl;
+    double tp;
+    double lots; // To detect partial closes if they reflect on OrderLots()
+};
+KnownOrderState ExtKnownOpenOrders[100]; // Max 100 open orders tracked, adjust if needed
+int ExtKnownOpenOrdersCount = 0;
+int ExtLastOrdersTotal = 0;       // To detect new/closed orders by count
+int ExtLastHistoryTotal = 0;      // To detect closed orders from history pool
+datetime ExtLastOnTickProcessedTime = 0; // To prevent processing too frequently if OnTick is rapid
+
 //+------------------------------------------------------------------+
-//| Trade event function                                             |
+//| Initialize order states                                          |
 //+------------------------------------------------------------------+
-//| IMPORTANT: OnTradeTransaction is an MQL5 feature. For MQL4,      |
-//| trade detection logic needs to be implemented in OnTick() by     |
-//| comparing current order states with previously stored states.    |
-//+------------------------------------------------------------------+
-void OnTradeTransaction(const MqlTradeTransaction& trans,
-                        const MqlTradeRequest& request,
-                        const MqlTradeResult& result)
-{
-    if (!ExtIsConnected)
-    {
-        Print("Not connected to server. Trade event ignored.");
-        if (!ConnectToServer()) {
-            Print("Failed to reconnect. Trade event lost.");
-            return;
+void InitializeOrderStates() {
+    ExtKnownOpenOrdersCount = 0;
+    for (int i = 0; i < OrdersTotal(); i++) {
+        if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
+            if (OrderMagicNumber() == 0 || AccountInfoInteger(ACCOUNT_LOGIN) == OrderMagicNumber()) { // Optional: Filter by current EA's magic or all manual trades
+                if (ExtKnownOpenOrdersCount < ArraySize(ExtKnownOpenOrders)) {
+                    ExtKnownOpenOrders[ExtKnownOpenOrdersCount].ticket = OrderTicket();
+                    ExtKnownOpenOrders[ExtKnownOpenOrdersCount].sl = OrderStopLoss();
+                    ExtKnownOpenOrders[ExtKnownOpenOrdersCount].tp = OrderTakeProfit();
+                    ExtKnownOpenOrders[ExtKnownOpenOrdersCount].lots = OrderLots();
+                    ExtKnownOpenOrdersCount++;
+                }
+            }
         }
-        Print("Reconnected. Will process next trade event.");
+    }
+    ExtLastOrdersTotal = OrdersTotal();
+    ExtLastHistoryTotal = HistoryTotal();
+    Print("Initial order states captured. Open orders tracked: ", ExtKnownOpenOrdersCount);
+}
+
+
+//+------------------------------------------------------------------+
+//| OnTick function (primary place for MQL4 trade detection)         |
+//+------------------------------------------------------------------+
+void OnTick() {
+    //--- Ensure connected
+    if (!ExtIsConnected) {
+        if (ConnectToServer()) {
+            Print("OnTick: Reconnected successfully. Initializing order states.");
+            InitializeOrderStates(); // Re-initialize states after reconnect
+        } else {
+            return; // Not connected, nothing to do
+        }
+    }
+
+    // Initialize states on first successful tick if not already done (e.g. after EA start/reconnect)
+    if (ExtLastOnTickProcessedTime == 0 && ExtIsConnected) {
+         InitializeOrderStates();
+    }
+    ExtLastOnTickProcessedTime = TimeCurrent();
+
+
+    // --- Detect Closed Orders by iterating history ---
+    // This is more reliable for detecting any type of close (manual, SL, TP)
+    if (HistoryTotal() > ExtLastHistoryTotal) {
+        for (int i = ExtLastHistoryTotal; i < HistoryTotal(); i++) {
+            if (OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) {
+                // Check if it's a closed trade relevant to us (e.g. by magic number or if we track all)
+                // And ensure it's actually a position closure (not balance operation etc.)
+                if (OrderType() == OP_BUY || OrderType() == OP_SELL) { // Only actual buy/sell orders
+                    // We need to confirm this order was previously open and known to us,
+                    // or assume any new history item is a close to be reported.
+                    // A simple way: if an order appears in history, it was closed or partially closed.
+                    // The ReceiverEA expects "DEAL_ENTRY_OUT" for closes.
+                    // We also need to provide the original order details as best as possible.
+                    // The "order" object in the JSON should reflect the state *before* closing if possible,
+                    // or at least its identifying characteristics.
+
+                    // Construct JSON for a closed order
+                    string orderJson = "{";
+                    orderJson += "\"ticket\":" + (string)OrderTicket() + ",";
+                    orderJson += "\"symbol\":\"" + OrderSymbol() + "\",";
+                    orderJson += "\"type\":" + (string)OrderType() + ",";
+                    orderJson += "\"lots\":" + DoubleToString(OrderLots(), OrderDigits()) + ","; // Original lots
+                    orderJson += "\"openPrice\":" + DoubleToString(OrderOpenPrice(), OrderDigits()) + ",";
+                    orderJson += "\"openTime\":\"" + TimeToString(OrderOpenTime(), TIME_DATE|TIME_SECONDS) + "\",";
+                    orderJson += "\"stopLoss\":" + DoubleToString(OrderStopLoss(), OrderDigits()) + ","; // SL at time of close
+                    orderJson += "\"takeProfit\":" + DoubleToString(OrderTakeProfit(), OrderDigits()) + ","; // TP at time of close
+                    orderJson += "\"closePrice\":" + DoubleToString(OrderClosePrice(), OrderDigits()) + ",";
+                    orderJson += "\"closeTime\":\"" + TimeToString(OrderCloseTime(), TIME_DATE|TIME_SECONDS) + "\",";
+                    orderJson += "\"commission\":" + DoubleToString(OrderCommission(), 2) + ",";
+                    orderJson += "\"swap\":" + DoubleToString(OrderSwap(), 2) + ",";
+                    orderJson += "\"profit\":" + DoubleToString(OrderProfit(), 2) + ",";
+                    orderJson += "\"comment\":\"" + StringSubst(OrderComment(),"\"","\\\"") + "\",";
+                    orderJson += "\"magicNumber\":" + (string)OrderMagicNumber();
+                    orderJson += "}";
+
+                    string dealJson = "{";
+                    dealJson += "\"order\":" + (string)OrderTicket() + ","; // Link to the order ticket that was closed
+                    dealJson += "\"entry\":\"DEAL_ENTRY_OUT\","; // Simulate MQL5 deal entry type for close
+                    dealJson += "\"lots\":" + DoubleToString(OrderLots(), OrderDigits()) + ""; // Lots closed (assuming full close here)
+                    // Add more deal fields if receiver needs them, like deal ticket (can be same as order ticket for MQL4 context)
+                    // dealJson += ", \"price\":" + DoubleToString(OrderClosePrice(), OrderDigits());
+                    // dealJson += ", \"time\":\"" + TimeToString(OrderCloseTime(), TIME_DATE|TIME_SECONDS) + "\"";
+                    dealJson += "}";
+
+                    SendTradeEvent("TRADE_TRANSACTION_DEAL", orderJson, dealJson);
+
+                    // Remove from known open orders if it was there
+                    RemoveKnownOrder(OrderTicket());
+                }
+            }
+        }
+    }
+    ExtLastHistoryTotal = HistoryTotal();
+
+
+    // --- Detect New Orders & Modifications for currently open orders ---
+    bool knownOrdersUpdated[100]; // Max 100
+    for(int k=0; k < ExtKnownOpenOrdersCount; k++) knownOrdersUpdated[k] = false;
+
+    int currentOpenOrderCount = 0;
+    for (int i = 0; i < OrdersTotal(); i++) {
+        if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
+            currentOpenOrderCount++;
+            // Optional: Filter by magic number if you only want to send trades from this EA or manual trades
+            // if (OrderMagicNumber() != 0 && OrderMagicNumber() != SomeSpecificMagicNumber) continue;
+
+            int knownIndex = FindKnownOrderIndex(OrderTicket());
+            string orderJson = "{";
+            orderJson += "\"ticket\":" + (string)OrderTicket() + ",";
+            orderJson += "\"symbol\":\"" + OrderSymbol() + "\",";
+            orderJson += "\"type\":" + (string)OrderType() + ",";
+            orderJson += "\"lots\":" + DoubleToString(OrderLots(), OrderDigits()) + ",";
+            orderJson += "\"openPrice\":" + DoubleToString(OrderOpenPrice(), OrderDigits()) + ",";
+            orderJson += "\"openTime\":\"" + TimeToString(OrderOpenTime(), TIME_DATE|TIME_SECONDS) + "\",";
+            orderJson += "\"stopLoss\":" + DoubleToString(OrderStopLoss(), OrderDigits()) + ",";
+            orderJson += "\"takeProfit\":" + DoubleToString(OrderTakeProfit(), OrderDigits()) + ",";
+            orderJson += "\"closePrice\":0,"; // Not closed
+            orderJson += "\"closeTime\":0,";  // Not closed
+            orderJson += "\"commission\":" + DoubleToString(OrderCommission(), 2) + ",";
+            orderJson += "\"swap\":" + DoubleToString(OrderSwap(), 2) + ",";
+            orderJson += "\"profit\":" + DoubleToString(OrderProfit(), 2) + ","; // Current floating profit
+            orderJson += "\"comment\":\"" + StringSubst(OrderComment(),"\"","\\\"") + "\",";
+            orderJson += "\"magicNumber\":" + (string)OrderMagicNumber();
+            orderJson += "}";
+
+            if (knownIndex == -1) { // New order
+                SendTradeEvent("TRADE_TRANSACTION_ORDER_ADD", orderJson, "null");
+                AddKnownOrder(OrderTicket(), OrderStopLoss(), OrderTakeProfit(), OrderLots());
+            } else { // Existing order, check for modification (SL/TP)
+                knownOrdersUpdated[knownIndex] = true;
+                bool modified = false;
+                if (ExtKnownOpenOrders[knownIndex].sl != OrderStopLoss() ||
+                    ExtKnownOpenOrders[knownIndex].tp != OrderTakeProfit()) {
+                    modified = true;
+                }
+                // Could also check for OrderLots() change for partial close detection if not handled by history
+                // For now, focusing on SL/TP modification for "ORDER_UPDATE"
+
+                if (modified) {
+                    SendTradeEvent("TRADE_TRANSACTION_ORDER_UPDATE", orderJson, "null");
+                    ExtKnownOpenOrders[knownIndex].sl = OrderStopLoss();
+                    ExtKnownOpenOrders[knownIndex].tp = OrderTakeProfit();
+                    ExtKnownOpenOrders[knownIndex].lots = OrderLots(); // Update lots too
+                }
+            }
+        }
+    }
+
+    // If OrdersTotal decreased, or if some known orders were not found in current open pool, they were closed
+    // This is a secondary check for closes, primary is history check.
+    // Clean up ExtKnownOpenOrders for any trades that are no longer open but weren't caught by history scan (e.g. if history scan is offset)
+    for (int k = ExtKnownOpenOrdersCount - 1; k >= 0; k--) {
+        if (!knownOrdersUpdated[k]) { // If it wasn't updated, it might be closed
+            if (OrderSelect(ExtKnownOpenOrders[k].ticket, SELECT_BY_TICKET, MODE_TRADES)) {
+                // Still open, something is wrong with knownOrdersUpdated logic or it's a new order not yet in list
+            } else {
+                // No longer in MODE_TRADES, so it's closed. History check should have caught it.
+                // This is a fallback cleanup.
+                Print("Order ", ExtKnownOpenOrders[k].ticket, " no longer open (fallback detection). Removing from known list.");
+                RemoveKnownOrderFromArray(k);
+            }
+        }
+    }
+
+    ExtLastOrdersTotal = currentOpenOrderCount; // Update to current actual open orders
+}
+
+
+//+------------------------------------------------------------------+
+//| Send Trade Event to Server                                       |
+//+------------------------------------------------------------------+
+void SendTradeEvent(string transactionType, string orderJson, string dealJson) {
+    if (!ExtIsConnected) {
+        Print("Not connected, cannot send trade event.");
         return;
     }
 
     string jsonPayload = "{";
     jsonPayload += "\"type\":\"tradeEvent\",";
     jsonPayload += "\"accountId\":\"" + AccountIdentifier + "\",";
-    jsonPayload += "\"transactionType\":\"" + EnumToString(trans.type) + "\","; // MQL5 specific, needs MQL4 mapping
-    jsonPayload += "\"timestamp\":" + (string)trans.time + ",";
-
-    // Order details
-    if (trans.order > 0) {
-        if (OrderSelect(trans.order, SELECT_BY_TICKET)) {
-            jsonPayload += "\"order\":{";
-            jsonPayload += "\"ticket\":" + (string)OrderTicket() + ",";
-            jsonPayload += "\"symbol\":\"" + OrderSymbol() + "\",";
-            jsonPayload += "\"type\":" + (string)OrderType() + ",";
-            jsonPayload += "\"lots\":" + DoubleToString(OrderLots(), OrderDigits()) + ",";
-            jsonPayload += "\"openPrice\":" + DoubleToString(OrderOpenPrice(), OrderDigits()) + ",";
-            jsonPayload += "\"openTime\":\"" + TimeToString(OrderOpenTime(), TIME_DATE|TIME_SECONDS) + "\",";
-            jsonPayload += "\"stopLoss\":" + DoubleToString(OrderStopLoss(), OrderDigits()) + ",";
-            jsonPayload += "\"takeProfit\":" + DoubleToString(OrderTakeProfit(), OrderDigits()) + ",";
-            jsonPayload += "\"closePrice\":" + DoubleToString(OrderClosePrice(), OrderDigits()) + ",";
-            jsonPayload += "\"closeTime\":\"" + TimeToString(OrderCloseTime(), TIME_DATE|TIME_SECONDS) + "\",";
-            jsonPayload += "\"commission\":" + DoubleToString(OrderCommission(), 2) + ",";
-            jsonPayload += "\"swap\":" + DoubleToString(OrderSwap(), 2) + ",";
-            jsonPayload += "\"profit\":" + DoubleToString(OrderProfit(), 2) + ",";
-            jsonPayload += "\"comment\":\"" + StringSubst(OrderComment(),"\"","\\\"") + "\","; // Escape quotes in comment
-            jsonPayload += "\"magicNumber\":" + (string)OrderMagicNumber();
-            jsonPayload += "}";
-        } else {
-            jsonPayload += "\"order\":{\"ticket\":" + (string)trans.order + ",\"error\":\"Failed to select order\"}";
-        }
-    } else {
-         jsonPayload += "\"order\":null";
-    }
-
-    jsonPayload += ",";
-
-    // Deal details
-    if (trans.deal > 0) {
-        if (HistoryDealSelect(trans.deal)) {
-            jsonPayload += "\"deal\":{";
-            jsonPayload += "\"ticket\":" + (string)HistoryDealGetInteger(trans.deal, DEAL_TICKET) + ",";
-            jsonPayload += "\"order\":" + (string)HistoryDealGetInteger(trans.deal, DEAL_ORDER) + ",";
-            jsonPayload += "\"symbol\":\"" + HistoryDealGetString(trans.deal, DEAL_SYMBOL) + "\",";
-            jsonPayload += "\"type\":" + (string)HistoryDealGetInteger(trans.deal, DEAL_TYPE) + ",";
-            jsonPayload += "\"entry\":" + (string)HistoryDealGetInteger(trans.deal, DEAL_ENTRY) + ",";
-            jsonPayload += "\"lots\":" + DoubleToString(HistoryDealGetDouble(trans.deal, DEAL_VOLUME), HistoryDealGetInteger(trans.deal, DEAL_DIGITS)) + ",";
-            jsonPayload += "\"price\":" + DoubleToString(HistoryDealGetDouble(trans.deal, DEAL_PRICE), HistoryDealGetInteger(trans.deal, DEAL_DIGITS)) + ",";
-            jsonPayload += "\"time\":\"" + TimeToString(HistoryDealGetInteger(trans.deal, DEAL_TIME), TIME_DATE|TIME_SECONDS) + "\",";
-            jsonPayload += "\"commission\":" + DoubleToString(HistoryDealGetDouble(trans.deal, DEAL_COMMISSION), 2) + ",";
-            jsonPayload += "\"swap\":" + DoubleToString(HistoryDealGetDouble(trans.deal, DEAL_SWAP), 2) + ",";
-            jsonPayload += "\"profit\":" + DoubleToString(HistoryDealGetDouble(trans.deal, DEAL_PROFIT), 2) + ",";
-            jsonPayload += "\"fee\":" + DoubleToString(HistoryDealGetDouble(trans.deal, DEAL_FEE), 2);
-            jsonPayload += "}";
-        } else {
-            jsonPayload += "\"deal\":{\"ticket\":" + (string)trans.deal + ",\"error\":\"Failed to select deal\"}";
-        }
-    } else {
-        jsonPayload += "\"deal\":null";
-    }
-
-    jsonPayload += ",";
-
-    // Request details
-    jsonPayload += "\"request\":{";
-    jsonPayload += "\"id\":" + (string)request.id + ",";
-    jsonPayload += "\"action\":" + (string)request.action; // MQL5 specific, needs MQL4 mapping
-    jsonPayload += "},";
-
-    // Result details
-    jsonPayload += "\"result\":{";
-    jsonPayload += "\"retcode\":" + (string)result.retcode + ",";
-    jsonPayload += "\"comment\":\"" + StringSubst(result.comment,"\"","\\\"") + "\""; // Escape quotes
-    jsonPayload += "}";
-
+    jsonPayload += "\"transactionType\":\"" + transactionType + "\",";
+    jsonPayload += "\"timestamp\":" + (string)TimeCurrent() + ","; // Current server time on MT4
+    jsonPayload += "\"order\":" + orderJson + ",";
+    jsonPayload += "\"deal\":" + dealJson;  // dealJson can be "null" if not applicable
+    // Request and Result objects are omitted for MQL4 OnTick implementation simplicity
+    // jsonPayload += ",\"request\":null,";
+    // jsonPayload += "\"result\":null";
     jsonPayload += "}";
 
     string messageToSend = jsonPayload + "\n";
+    Print("Sending event: ", transactionType, " for order details: ", orderJson, " deal details: ", dealJson);
 
-    Print("Sending trade event: ", messageToSend);
-    if (SocketSend(ExtSocketHandle, messageToSend, StringLen(messageToSend)) <= 0)
-    {
+    if (SocketSend(ExtSocketHandle, messageToSend, StringLen(messageToSend)) <= 0) {
         Print("Failed to send trade event. Error: ", GetLastError());
         SocketClose(ExtSocketHandle);
         ExtSocketHandle = INVALID_SOCKET;
         ExtIsConnected = false;
-    }
-    else
-    {
-        Print("Trade event sent successfully.");
+        ExtLastOnTickProcessedTime = 0; // Reset to re-init states on next connect
+    } else {
+        // Print("Trade event sent successfully.");
     }
 }
 
 //+------------------------------------------------------------------+
-//| OnTick function (for MQL4, primary place for trade detection)    |
+//| Helper functions for managing known orders                       |
 //+------------------------------------------------------------------+
-void OnTick()
-{
-    //--- Check connection status and try to reconnect if necessary
-    if (!ExtIsConnected)
-    {
-        if (ConnectToServer())
-        {
-            Print("OnTick: Reconnected successfully.");
+int FindKnownOrderIndex(int ticket) {
+    for (int i = 0; i < ExtKnownOpenOrdersCount; i++) {
+        if (ExtKnownOpenOrders[i].ticket == ticket) return i;
+    }
+    return -1;
+}
+
+void AddKnownOrder(int ticket, double sl, double tp, double lots) {
+    if (ExtKnownOpenOrdersCount < ArraySize(ExtKnownOpenOrders)) {
+        if (FindKnownOrderIndex(ticket) == -1) { // Ensure not already added
+            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].ticket = ticket;
+            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].sl = sl;
+            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].tp = tp;
+            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].lots = lots;
+            ExtKnownOpenOrdersCount++;
+            Print("Added to known orders: ", ticket);
         }
+    } else {
+        Print("Known open orders array is full. Cannot add ticket: ", ticket);
     }
-
-    // For MQL4, trade detection logic would go here.
-    // This involves:
-    // 1. Storing the state of orders (number, tickets, SL, TP, etc.) from the previous tick.
-    // 2. Comparing with the current state in this tick.
-    // 3. Identifying new orders, closed orders, modified orders.
-    // 4. Formatting and sending the appropriate JSON message.
-    // This is a complex task and `OnTradeTransaction` is used above as a placeholder
-    // for what data needs to be sent once an event IS detected.
-    // If you are using a pure MQL4 environment, you MUST implement this logic here.
 }
 
-// Helper for MQL4 as EnumToString is MQL5.
-// This is a simplified version. A full version would cover all relevant enums.
-string EnumToString(int enum_value) {
-    // This function would need to be expanded to cover all relevant MQL4/MQL5 enums
-    // For example, for transaction types (MqlTradeTransactionType for MQL5)
-    // For MQL4, you'd be detecting event types yourself and creating your own string representation.
-    return IntegerToString(enum_value);
+void RemoveKnownOrderFromArray(int index) { // Removes by array index
+    if (index < 0 || index >= ExtKnownOpenOrdersCount) return;
+    Print("Removing from known orders by index ", index, ", ticket ", ExtKnownOpenOrders[index].ticket);
+    for (int i = index; i < ExtKnownOpenOrdersCount - 1; i++) {
+        ExtKnownOpenOrders[i] = ExtKnownOpenOrders[i+1];
+    }
+    ExtKnownOpenOrdersCount--;
 }
 
-// Helper to escape quotes in strings for JSON
+void RemoveKnownOrder(int ticket) { // Removes by ticket number
+    int index = FindKnownOrderIndex(ticket);
+    if (index != -1) {
+        RemoveKnownOrderFromArray(index);
+    }
+}
+
+// Helper to escape quotes in strings for JSON (simplified)
 string StringSubst(string text, string find, string replace) {
     string result = text;
     int findLen = StringLen(find);
+    if (findLen == 0) return text; // Avoid infinite loop if find is empty
     int replaceLen = StringLen(replace);
     int pos = StringFind(result, find, 0);
     while (pos != -1) {
@@ -308,4 +424,12 @@ string StringSubst(string text, string find, string replace) {
         pos = StringFind(result, find, pos + replaceLen);
     }
     return result;
+}
+
+// EnumToString is not needed if we manually set transactionType strings.
+/*
+string EnumToString(int enum_value) {
+    return IntegerToString(enum_value);
+}
+*/
 }
