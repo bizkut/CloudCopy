@@ -5,11 +5,11 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2023, Your Name/Company"
 #property link      "https://example.com"
-#property version   "1.10" // Version updated for new socket library
+#property version   "1.12" // Version updated for millisecond timestamp (manual provision)
 #property strict
 
 //--- Include necessary libraries
-#include "socket-library-mt4-mt5.mqh" // Use the new socket library
+#include <socket-library-mt4-mt5.mqh> // Use the new socket library
 #include <stdlib.mqh>                 // For StringToDouble, StringToInteger, etc.
 
 //--- Input parameters
@@ -22,23 +22,18 @@ input int MagicNumberReceiver = 12345;
 ClientSocket *g_clientSocket = NULL; // Use the ClientSocket class from the library
 
 bool ExtIsConnected = false; // EA's internal flag for connection status
-// ExtIdentified is implicitly true if connected for receiver, as ID is sent on connect
 datetime ExtLastHeartbeatSent = 0;
 int ExtHeartbeatInterval = 30; // Seconds
-// string ExtSocketBuffer = ""; // No longer needed, library handles internal buffering for Receive
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit() {
-    // WSAStartup is not called here; assuming library handles it or relies on system state.
-    if (!ConnectToServer()) { // ConnectToServer now also sends identification
+    if (!ConnectToServer()) {
         Print("ReceiverEA: Initial connection and identification failed during OnInit.");
-        // No WSACleanup here
         return(INIT_FAILED);
     }
-
-    EventSetTimer(1); // Timer for heartbeats and checking messages
+    EventSetTimer(1);
     Print("ReceiverEA: Initialized, connected and identified.");
     return(INIT_SUCCEEDED);
 }
@@ -55,7 +50,6 @@ void OnDeinit(const int reason) {
         g_clientSocket = NULL;
     }
     ExtIsConnected = false;
-    // WSACleanup is not called here.
     Print("ReceiverEA: Deinitialized. Reason: ", reason);
 }
 
@@ -63,44 +57,40 @@ void OnDeinit(const int reason) {
 //| Timer function                                                   |
 //+------------------------------------------------------------------+
 void OnTimer() {
-    //--- Check connection status & attempt reconnect/re-identify if needed ---
     if (g_clientSocket == NULL || !g_clientSocket.IsSocketConnected()) {
-        ExtIsConnected = false; // Ensure our flag reflects reality
+        ExtIsConnected = false;
         Print("ReceiverEA Timer: Not connected. Attempting to connect and identify...");
-        if (ConnectToServer()) { // This function now also sets ExtIsConnected and sends ID
+        if (ConnectToServer()) {
             Print("ReceiverEA Timer: Connection and identification attempt successful.");
         } else {
             Print("ReceiverEA Timer: Connection and identification attempt failed. Will retry on next timer tick.");
-            return; // Wait for next timer tick
+            return;
         }
     }
-    // At this point, g_clientSocket should be non-NULL and connected, and identification sent.
-    // ExtIsConnected should be true.
 
-    //--- Send heartbeat if due ---
     if (ExtIsConnected && (TimeCurrent() - ExtLastHeartbeatSent >= ExtHeartbeatInterval)) {
         string currentReceiverMT4AccountId = IntegerToString(AccountNumber());
-        string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + currentReceiverMT4AccountId + "\",\"timestamp\":" + (string)TimeCurrent() + "}";
+        string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + currentReceiverMT4AccountId + "\",\"timestamp\":" + DoubleToString(TimeCurrent() * 1000.0, 0) + "}"; // Milliseconds
         string msgWithNewline = heartbeatMsg + "\n";
 
-        // Print("ReceiverEA Timer: Sending heartbeat..."); // Optional verbose log
+        Print("ReceiverEA: Preparing Heartbeat JSON: ", heartbeatMsg);
+
         if (g_clientSocket.Send(msgWithNewline)) {
             if (g_clientSocket.IsSocketConnected()) {
                 ExtLastHeartbeatSent = TimeCurrent();
             } else {
                 Print("ReceiverEA Timer: Heartbeat send attempted, but socket disconnected. Error: ", g_clientSocket.GetLastSocketError());
-                ExtIsConnected = false; // Will trigger reconnect in next OnTimer
+                ExtIsConnected = false;
             }
         } else {
             Print("ReceiverEA Timer: Failed to send heartbeat. Error: ", g_clientSocket.GetLastSocketError());
             if (!g_clientSocket.IsSocketConnected()){
-                 ExtIsConnected = false; // Will trigger reconnect in next OnTimer
+                 ExtIsConnected = false;
             }
         }
     }
 
-    //--- Check for incoming messages ---
-    if (ExtIsConnected) { // Only try to receive if we believe we are connected
+    if (ExtIsConnected) {
         ReceiveMessages();
     }
 }
@@ -110,22 +100,17 @@ void OnTimer() {
 //+------------------------------------------------------------------+
 bool ConnectToServer() {
     if (g_clientSocket != NULL && g_clientSocket.IsSocketConnected()) {
-        // If called when already connected, maybe just ensure ID was sent or resend?
-        // For now, assume if socket object exists and is connected, initial ID was sent.
-        // Or, the caller (OnInit/OnTimer) handles the logic of when to call this.
-        // Let's stick to: if this function is called, it tries to establish a fresh connection & ID.
-         Print("ReceiverEA: ConnectToServer called, but already connected. Assuming ID sent. To force reconnect, disconnect first.");
-         ExtIsConnected = true; // Ensure flag is set
+         Print("ReceiverEA: ConnectToServer called, but already connected. Assuming ID sent.");
+         ExtIsConnected = true;
          return true;
     }
 
-    // Clean up existing socket object if it exists
     if (g_clientSocket != NULL) {
         Print("ReceiverEA: Cleaning up previous socket instance.");
         delete g_clientSocket;
         g_clientSocket = NULL;
     }
-    ExtIsConnected = false; // Reset connection flag
+    ExtIsConnected = false;
 
     Print("ReceiverEA: Attempting to connect to ", ServerAddress, ":", ServerPort, "...");
     g_clientSocket = new ClientSocket(ServerAddress, ServerPort);
@@ -143,83 +128,75 @@ bool ConnectToServer() {
     }
 
     Print("ReceiverEA: Successfully connected to server. Sending identification...");
-    ExtIsConnected = true; // Mark as connected
+    ExtIsConnected = true;
 
-    // Send identification message
     string currentReceiverMT4AccountId = IntegerToString(AccountNumber());
     string identMsg = "{\"type\":\"identification\",\"role\":\"receiver\"";
     identMsg += ",\"accountId\":\"" + currentReceiverMT4AccountId + "\"";
     identMsg += ",\"listenTo\":\"" + SenderAccountIdToFollow + "\"}";
     string identMsgWithNewline = identMsg + "\n";
 
+    Print("ReceiverEA: Preparing Identification JSON: ", identMsg);
+
     if (g_clientSocket.Send(identMsgWithNewline)) {
         if (g_clientSocket.IsSocketConnected()) {
             Print("ReceiverEA: Identification message sent successfully.");
-            ExtLastHeartbeatSent = TimeCurrent(); // Reset heartbeat as we had successful comms
+            ExtLastHeartbeatSent = TimeCurrent();
             return true;
         } else {
             Print("ReceiverEA: Identification send attempted, but socket disconnected. Error: ", g_clientSocket.GetLastSocketError());
-            ExtIsConnected = false; // Mark as disconnected
-            // g_clientSocket will be cleaned up/recreated by OnTimer's logic
+            ExtIsConnected = false;
             return false;
         }
     } else {
         Print("ReceiverEA: Failed to send identification message. Error: ", g_clientSocket.GetLastSocketError());
         if (!g_clientSocket.IsSocketConnected()) {
-            ExtIsConnected = false; // Mark as disconnected
+            ExtIsConnected = false;
         }
-        // g_clientSocket might still exist but failed to send; OnTimer will handle.
         return false;
     }
 }
-
 
 //+------------------------------------------------------------------+
 //| Receive messages from server                                     |
 //+------------------------------------------------------------------+
 void ReceiveMessages() {
-    // Ensure we have a valid, connected socket
     if (g_clientSocket == NULL || !g_clientSocket.IsSocketConnected()) {
-        if (ExtIsConnected) { // If our flag was true but socket says no
+        if (ExtIsConnected) {
              Print("ReceiverEA: ReceiveMessages called but found disconnected state. Error: ", (g_clientSocket ? (string)g_clientSocket.GetLastSocketError() : "Socket is NULL"));
         }
-        ExtIsConnected = false; // Correct our state
+        ExtIsConnected = false;
         return;
     }
 
     string message;
     int messagesProcessedThisCycle = 0;
     do {
-        message = g_clientSocket.Receive("\n"); // Using newline as the message separator
+        message = g_clientSocket.Receive("\n");
         if (message != "") {
-            // Print("ReceiverEA: Raw message received: '", message, "'"); // Debugging
-            string trimmedMessage = StringTrim(message); // Use the new helper function
-            if (trimmedMessage != "") { // Check the trimmed message
-                 Print("ReceiverEA: Processing message: ", trimmedMessage); // Log the trimmed message
-                 ProcessServerMessage(trimmedMessage); // Process the trimmed message
+            string trimmedMessage = StringTrim(message);
+            if (trimmedMessage != "") {
+                 Print("ReceiverEA: Processing message: ", trimmedMessage);
+                 ProcessServerMessage(trimmedMessage);
                  messagesProcessedThisCycle++;
             }
         }
-    } while (message != "" && messagesProcessedThisCycle < 100); // Loop to process all buffered messages, with a safety break
+    } while (message != "" && messagesProcessedThisCycle < 100);
 
     if (messagesProcessedThisCycle >= 100) {
         Print("ReceiverEA: Processed 100 messages in one cycle. More might be pending.");
     }
 
-    // After attempting to receive, check connection status again, as Receive can detect a disconnect
     if (!g_clientSocket.IsSocketConnected()) {
         Print("ReceiverEA: Disconnected from server during/after receive operation. Error: ", g_clientSocket.GetLastSocketError());
-        ExtIsConnected = false; // This will trigger reconnection attempt in OnTimer
-        // No need to delete g_clientSocket here, OnTimer will handle it
+        ExtIsConnected = false;
     }
 }
 
-
 //+------------------------------------------------------------------+
-//| Process a single message from the server (logic remains same)    |
+//| Process a single message from the server                         |
 //+------------------------------------------------------------------+
 void ProcessServerMessage(string message) {
-    // Print("Server message: ", message); // Already printed by ReceiveMessages
     string msgType = ParseJsonValue(message, "type");
 
     if (msgType == "ack") {
@@ -228,13 +205,8 @@ void ProcessServerMessage(string message) {
             Print("ReceiverEA: ACK - Authenticated as PRIMARY data connection.");
         } else if (ackStatus == "authenticated_duplicate") {
             Print("ReceiverEA: ACK - Authenticated as DUPLICATE stream. No trade data will be sent to this instance.");
-            // Consider if EA should stop or notify user prominently
         } else if (ackStatus == "unauthorized") {
             Print("ReceiverEA: ERROR - Server reported this account is UNAUTHORIZED.");
-            // Consider if EA should stop or notify user prominently
-        } else {
-            // Generic ACK, e.g. for heartbeat
-            // Print("ReceiverEA: Received ACK from server: ", message);
         }
         return;
     }
@@ -243,8 +215,6 @@ void ProcessServerMessage(string message) {
         string errorStatus = ParseJsonValue(message, "status");
          if (errorStatus == "unauthorized") {
             Print("ReceiverEA: CRITICAL - Server reported this account is UNAUTHORIZED during operation.");
-            // This is more severe than an unauthorized ACK on identification
-            // Consider stopping the EA or specific actions
         }
         return;
     }
@@ -278,7 +248,7 @@ void ProcessServerMessage(string message) {
 }
 
 //+------------------------------------------------------------------+
-//| Handle Open Trade Signal (logic remains same)                    |
+//| Handle Open Trade Signal                                         |
 //+------------------------------------------------------------------+
 void HandleOpenTrade(string orderJson, long senderTicket) {
     string symbol = ParseJsonValue(orderJson, "symbol");
@@ -315,7 +285,7 @@ void HandleOpenTrade(string orderJson, long senderTicket) {
 }
 
 //+------------------------------------------------------------------+
-//| Handle Modify Trade Signal (SL/TP) (logic remains same)          |
+//| Handle Modify Trade Signal (SL/TP)                               |
 //+------------------------------------------------------------------+
 void HandleModifyTrade(string orderJson, long senderTicket) {
     string symbol = ParseJsonValue(orderJson, "symbol");
@@ -343,7 +313,6 @@ void HandleModifyTrade(string orderJson, long senderTicket) {
 
     if (MathAbs(currentOrderSL - newSL) < SymbolInfoDouble(symbol, SYMBOL_POINT) * 0.1 &&
         MathAbs(currentOrderTP - newTP) < SymbolInfoDouble(symbol, SYMBOL_POINT) * 0.1) {
-        // Print("ReceiverEA ModifyTrade: No significant change in SL/TP for ticket ", receiverTicket); // Optional log
         return;
     }
 
@@ -357,7 +326,7 @@ void HandleModifyTrade(string orderJson, long senderTicket) {
 }
 
 //+------------------------------------------------------------------+
-//| Handle Close Trade Signal (logic remains same, but check lots)   |
+//| Handle Close Trade Signal                                        |
 //+------------------------------------------------------------------+
 void HandleCloseTrade(string symbol, long senderTicket, double closedLotsFromSignal) {
     if (symbol == "") { Print("ReceiverEA CloseTrade: Symbol is empty."); return; }
@@ -372,17 +341,12 @@ void HandleCloseTrade(string symbol, long senderTicket, double closedLotsFromSig
         return;
     }
 
-    double lotsToClose = OrderLots(); // Default to full close
+    double lotsToClose = OrderLots();
     if (closedLotsFromSignal > 0 && closedLotsFromSignal < OrderLots()) {
-       // For now, still full close as per original logic.
-       // To implement partial close: lotsToClose = closedLotsFromSignal;
        Print("ReceiverEA CloseTrade: Signal indicates partial close of ", closedLotsFromSignal, " for ticket ", receiverTicket, ". Full close will be attempted for simplicity as per current EA logic.");
     } else if (closedLotsFromSignal == 0) {
         Print("ReceiverEA CloseTrade: Signal did not specify lots to close for ticket ", receiverTicket, " (or specified 0). Assuming full close.");
-    } else if (closedLotsFromSignal >= OrderLots()) {
-        // Signal lots match or exceed order lots, so full close.
     }
-
 
     Print("ReceiverEA: Attempting to CLOSE Ticket: ", receiverTicket, " Symbol: ", symbol, " Lots: ", DoubleToString(lotsToClose, MarketLotsDigits(symbol)));
     bool closed = OrderClose(receiverTicket, lotsToClose, OrderClosePrice(), 3, CLR_NONE);
@@ -394,7 +358,7 @@ void HandleCloseTrade(string symbol, long senderTicket, double closedLotsFromSig
 }
 
 //+------------------------------------------------------------------+
-//| Find a copied trade (logic remains same)                         |
+//| Find a copied trade                                              |
 //+------------------------------------------------------------------+
 int FindCopiedTrade(string symbol, long senderTicket, int orderTypeToMatch) {
     string searchComment = "CPY:" + SenderAccountIdToFollow + ":" + (string)senderTicket;
@@ -411,7 +375,7 @@ int FindCopiedTrade(string symbol, long senderTicket, int orderTypeToMatch) {
 }
 
 //+------------------------------------------------------------------+
-//| JSON Parsers (logic remains same)                                |
+//| JSON Parsers                                                     |
 //+------------------------------------------------------------------+
 string ParseJsonValue(string json, string key) {
     string searchPattern = "\"" + key + "\":";
@@ -457,7 +421,7 @@ string GetJsonObjectString(string json, string key) {
 }
 
 //+------------------------------------------------------------------+
-//| OnTick function (remains empty)                                  |
+//| OnTick function                                                  |
 //+------------------------------------------------------------------+
 void OnTick() {}
 
@@ -469,7 +433,7 @@ string StringTrim(string text) {
 }
 
 //+------------------------------------------------------------------+
-//| Helper for lot size string formatting (consistent with SenderEA) |
+//| Helper for lot size string formatting                            |
 //+------------------------------------------------------------------+
 int MarketLotsDigits(string symbol) {
     double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
@@ -477,10 +441,9 @@ int MarketLotsDigits(string symbol) {
     if (lotStep == 0.1) return 1;
     if (lotStep == 0.01) return 2;
     if (lotStep == 0.001) return 3;
-    return 2; // Default
+    return 2;
 }
 
-// EnumToString can be useful for logging (consistent with SenderEA)
 string EnumToString(int enum_value) {
     switch(enum_value) {
         case OP_BUY: return "OP_BUY";
@@ -493,4 +456,3 @@ string EnumToString(int enum_value) {
     }
 }
 //+------------------------------------------------------------------+
-//Dummy line to ensure replace block works if the file is identical.
