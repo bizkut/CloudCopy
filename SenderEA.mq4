@@ -5,24 +5,24 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024, Your Name/Company"
 #property link      "https://example.com"
-#property version   "1.52" // Version updated for millisecond timestamp (manual provision)
+#property version   "1.53" // Final version with all fixes
 #property strict
 
 //--- Include new socket library
-#include <socket-library-mt4-mt5.mqh> // Assuming this is in MQL4/Include or same dir
+#include <socket-library-mt4-mt5.mqh>
 
 //--- Input parameters
-input string ServerAddress = "metaapi.gametrader.my"; // Can now be hostname or IP
+input string ServerAddress = "metaapi.gametrader.my";
 input int ServerPort = 3000;
 input string AccountIdentifier = "SenderAccount123";
 
 //--- Global variables
-ClientSocket *g_clientSocket = NULL; // Use the ClientSocket class from the library
+ClientSocket *g_clientSocket = NULL;
 
-bool ExtIsConnected = false; // EA's internal flag for connection status
-bool ExtIdentified = false;  // EA's internal flag for identification status
+bool ExtIsConnected = false;
+bool ExtIdentified = false;
 datetime ExtLastHeartbeatSent = 0;
-int ExtHeartbeatInterval = 30;       // Seconds
+int ExtHeartbeatInterval = 30;
 
 struct KnownOrderState {
     int    ticket;
@@ -46,24 +46,24 @@ string EscapeJsonString(string text) {
     for (int i = 0; i < len; i++) {
         char ch = StringGetCharacter(text, i);
         switch (ch) {
-            case '\\': result += "\\\\"; break; 
-            case '"':  result += "\\\""; break; 
-            case 8:    result += "\\b";  break;  // Backspace
-            case 12:   result += "\\f";  break;  // Form feed
-            case 10:   result += "\\n";  break;  // Newline
-            case 13:   result += "\\r";  break;  // Carriage return
-            case 9:    result += "\\t";  break;  // Tab
+            case '\\': result += "\\\\"; break;
+            case '"':  result += "\\\""; break;
+            case 8:    result += "\\b";  break;
+            case 12:   result += "\\f";  break;
+            case 10:   result += "\\n";  break;
+            case 13:   result += "\\r";  break;
+            case 9:    result += "\\t";  break;
             default:
-                if (ch < 32 || ch == 127) { 
+                if (ch < 32 || ch == 127) {
                     string temp;
-                    temp = "\\u00"; 
+                    temp = "\\u00";
                     int h1 = ch / 16;
                     int h2 = ch % 16;
                     temp += (h1 < 10 ? (string)h1 : CharToStr((char)('A' + h1 - 10)));
                     temp += (h2 < 10 ? (string)h2 : CharToStr((char)('A' + h2 - 10)));
                     result += temp;
                 } else {
-                    result += CharToStr(ch); 
+                    result += CharToStr(ch);
                 }
         }
     }
@@ -74,10 +74,10 @@ string EscapeJsonString(string text) {
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit() {
-    EventSetTimer(1); 
+    EventSetTimer(1);
     Print("SenderEA: Initialized. AccountIdentifier: ", AccountIdentifier);
     ExtLastOnTickProcessedTime = 0;
-    ArrayResize(ExtKnownOpenOrders, 200); 
+    ArrayResize(ExtKnownOpenOrders, 200);
     return(INIT_SUCCEEDED);
 }
 
@@ -101,44 +101,41 @@ void OnDeinit(const int reason) {
 //| Timer function (for heartbeats and connection management)        |
 //+------------------------------------------------------------------+
 void OnTimer() {
-    //--- Connection Management ---
     if (g_clientSocket == NULL || !g_clientSocket.IsSocketConnected()) {
-        ExtIsConnected = false; 
-        ExtIdentified = false;  
-        ExtLastOnTickProcessedTime = 0; 
-        
+        ExtIsConnected = false;
+        ExtIdentified = false;
+        ExtLastOnTickProcessedTime = 0;
+
         Print("SenderEA Timer: Not connected. Attempting to connect...");
-        if (ConnectToServer()) { 
+        if (ConnectToServer()) {
             Print("SenderEA Timer: Connection attempt successful.");
         } else {
             Print("SenderEA Timer: Connection attempt failed. Will retry on next timer tick.");
-            return; 
+            return;
         }
     }
 
-    //--- Identification ---
     if (ExtIsConnected && !ExtIdentified) {
         Print("SenderEA Timer: Connected, attempting identification...");
         if (SendIdentification()) {
-            ExtIdentified = true; 
+            ExtIdentified = true;
             Print("SenderEA Timer: Identification successful. Initializing order states.");
-            InitializeOrderStates(); 
+            InitializeOrderStates();
         } else {
             Print("SenderEA Timer: Identification failed. Will retry on next timer tick if still connected.");
-            return; 
+            return;
         }
     }
 
-    //--- Heartbeat ---
     if (ExtIsConnected && ExtIdentified && (TimeCurrent() - ExtLastHeartbeatSent >= ExtHeartbeatInterval)) {
-        string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + AccountIdentifier + "\",\"timestamp\":" + DoubleToString(TimeCurrent() * 1000.0, 0) + "}"; // Milliseconds
+        string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + AccountIdentifier + "\",\"timestamp\":" + DoubleToString(TimeCurrent() * 1000.0, 0) + "}";
         string msgWithNewline = heartbeatMsg + "\n";
-        
-        Print("SenderEA: Preparing Heartbeat JSON: ", heartbeatMsg); 
+
+        Print("SenderEA: Preparing Heartbeat JSON: ", heartbeatMsg);
 
         Print("SenderEA Timer: Sending heartbeat...");
         if (g_clientSocket != NULL && g_clientSocket.Send(msgWithNewline)) {
-            if (g_clientSocket.IsSocketConnected()) { 
+            if (g_clientSocket.IsSocketConnected()) {
                 ExtLastHeartbeatSent = TimeCurrent();
             } else {
                 Print("SenderEA Timer: Heartbeat send attempted, but socket disconnected during/after send. Error: ", g_clientSocket.GetLastSocketError());
@@ -149,13 +146,13 @@ void OnTimer() {
             Print("SenderEA Timer: Failed to send heartbeat.");
             if (g_clientSocket != NULL) {
                  Print("SenderEA Timer: Heartbeat send error: ", g_clientSocket.GetLastSocketError());
-                 if (!g_clientSocket.IsSocketConnected()){ 
+                 if (!g_clientSocket.IsSocketConnected()){
                     ExtIsConnected = false;
                     ExtIdentified = false;
                  }
             } else {
                 Print("SenderEA Timer: Heartbeat send failed, socket object is NULL.");
-                ExtIsConnected = false; 
+                ExtIsConnected = false;
                 ExtIdentified = false;
             }
         }
@@ -171,8 +168,8 @@ bool ConnectToServer() {
         delete g_clientSocket;
         g_clientSocket = NULL;
     }
-    ExtIsConnected = false; 
-    ExtIdentified = false;  
+    ExtIsConnected = false;
+    ExtIdentified = false;
 
     Print("SenderEA: Attempting to connect to ", ServerAddress, ":", ServerPort, "...");
     g_clientSocket = new ClientSocket(ServerAddress, ServerPort);
@@ -184,11 +181,11 @@ bool ConnectToServer() {
 
     if (g_clientSocket.IsSocketConnected()) {
         Print("SenderEA: Successfully connected to server.");
-        ExtIsConnected = true; 
+        ExtIsConnected = true;
         return true;
     } else {
         Print("SenderEA: Failed to connect to server. Error: ", g_clientSocket.GetLastSocketError());
-        delete g_clientSocket; 
+        delete g_clientSocket;
         g_clientSocket = NULL;
         return false;
     }
@@ -200,7 +197,7 @@ bool ConnectToServer() {
 bool SendIdentification() {
     if (g_clientSocket == NULL || !g_clientSocket.IsSocketConnected()) {
          Print("SenderEA: Cannot send identification, not connected.");
-         ExtIsConnected = false; 
+         ExtIsConnected = false;
          ExtIdentified = false;
          return false;
     }
@@ -208,23 +205,23 @@ bool SendIdentification() {
     string identMsg = "{\"type\":\"identification\",\"role\":\"sender\",\"accountId\":\"" + AccountIdentifier + "\"}";
     string msgWithNewline = identMsg + "\n";
 
-    Print("SenderEA: Preparing Identification JSON: ", identMsg); 
-    
+    Print("SenderEA: Preparing Identification JSON: ", identMsg);
+
     Print("SenderEA: Sending identification message...");
     if (g_clientSocket.Send(msgWithNewline)) {
-        if (g_clientSocket.IsSocketConnected()) { 
+        if (g_clientSocket.IsSocketConnected()) {
             Print("SenderEA: Identification message sent successfully.");
-            ExtLastHeartbeatSent = TimeCurrent(); 
+            ExtLastHeartbeatSent = TimeCurrent();
             return true;
         } else {
             Print("SenderEA: Identification send attempted, but socket disconnected. Error: ", g_clientSocket.GetLastSocketError());
-            ExtIsConnected = false; 
+            ExtIsConnected = false;
             ExtIdentified = false;
             return false;
         }
     } else {
         Print("SenderEA: Failed to send identification message. Error: ", g_clientSocket.GetLastSocketError());
-        if (!g_clientSocket.IsSocketConnected()) { 
+        if (!g_clientSocket.IsSocketConnected()) {
             ExtIsConnected = false;
             ExtIdentified = false;
         }
@@ -255,16 +252,15 @@ void InitializeOrderStates() {
     }
     ExtLastHistoryTotal = HistoryTotal();
     Print("SenderEA: Initial order states captured. Open orders tracked: ", ExtKnownOpenOrdersCount, ". HistoryTotal: ", ExtLastHistoryTotal);
-    ExtLastOnTickProcessedTime = TimeCurrent(); 
+    ExtLastOnTickProcessedTime = TimeCurrent();
 }
-
 
 //+------------------------------------------------------------------+
 //| OnTick function                                                  |
 //+------------------------------------------------------------------+
 void OnTick() {
     if (!ExtIsConnected || !ExtIdentified || g_clientSocket == NULL || !g_clientSocket.IsSocketConnected()) {
-        if(ExtIsConnected || ExtIdentified){ 
+        if(ExtIsConnected || ExtIdentified){
             Print("SenderEA OnTick: Discrepancy in connection/identification state. Socket Connected: ", (g_clientSocket!=NULL && g_clientSocket.IsSocketConnected()), " ExtIsConnected: ", ExtIsConnected, " ExtIdentified: ", ExtIdentified);
             ExtIsConnected = false;
             ExtIdentified = false;
@@ -274,24 +270,24 @@ void OnTick() {
     }
 
     if (ExtLastOnTickProcessedTime == 0) {
-         InitializeOrderStates(); 
-         if(ExtLastOnTickProcessedTime == 0) { 
+         InitializeOrderStates();
+         if(ExtLastOnTickProcessedTime == 0) {
             Print("SenderEA OnTick: ExtLastOnTickProcessedTime is still 0 after expected init. Re-initializing.");
             InitializeOrderStates();
-            if(ExtLastOnTickProcessedTime == 0) { 
+            if(ExtLastOnTickProcessedTime == 0) {
                 Print("SenderEA OnTick: Critical - could not initialize order states time. Aborting tick.");
                 return;
             }
          }
     }
-    
+
     // --- Detect Closed Orders by iterating history ---
     if (HistoryTotal() > ExtLastHistoryTotal) {
         for (int i = ExtLastHistoryTotal; i < HistoryTotal(); i++) {
             if (OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) {
-                if (OrderType() == OP_BUY || OrderType() == OP_SELL) { 
+                if (OrderType() == OP_BUY || OrderType() == OP_SELL) {
                     int knownIndex = FindKnownOrderIndex(OrderTicket());
-                    if (knownIndex != -1) { 
+                    if (knownIndex != -1) {
                         string orderSymbol = OrderSymbol();
                         int symDigits = (int)SymbolInfoInteger(orderSymbol, SYMBOL_DIGITS);
 
@@ -313,14 +309,14 @@ void OnTick() {
                         orderJson += "\"magicNumber\":" + (string)OrderMagicNumber(); // Last item
                         orderJson += "}";
 
-                        string dealJson = "{"; 
+                        string dealJson = "{";
                         dealJson += "\"order\":" + (string)OrderTicket() + ",";
-                        dealJson += "\"entry\":\"DEAL_ENTRY_OUT\","; 
+                        dealJson += "\"entry\":\"DEAL_ENTRY_OUT\",";
                         dealJson += "\"lots\":" + DoubleToString(OrderLots(), MarketLotsDigits(orderSymbol)); // Last item
                         dealJson += "}";
 
                         SendTradeEvent("TRADE_TRANSACTION_DEAL", orderJson, dealJson);
-                        RemoveKnownOrder(OrderTicket()); 
+                        RemoveKnownOrder(OrderTicket());
                     }
                 }
             }
@@ -328,7 +324,7 @@ void OnTick() {
     }
     ExtLastHistoryTotal = HistoryTotal();
 
-    bool currentKnownOrderFound[200]; 
+    bool currentKnownOrderFound[200];
     if(ArraySize(ExtKnownOpenOrders) > 0) ArrayInitialize(currentKnownOrderFound, false);
 
     for (int i = 0; i < OrdersTotal(); i++) {
@@ -354,7 +350,7 @@ void OnTick() {
             orderJson += "\"openTime\":\"" + TimeToString(OrderOpenTime(), TIME_DATE|TIME_SECONDS) + "\",";
             orderJson += "\"stopLoss\":" + DoubleToString(currentSL, symDigits) + ",";
             orderJson += "\"takeProfit\":" + DoubleToString(currentTP, symDigits) + ",";
-            orderJson += "\"closePrice\":0,"; 
+            orderJson += "\"closePrice\":0,";
             orderJson += "\"closeTime\":0,";
             orderJson += "\"commission\":" + DoubleToString(OrderCommission(), 2) + ",";
             orderJson += "\"swap\":" + DoubleToString(OrderSwap(), 2) + ",";
@@ -363,13 +359,13 @@ void OnTick() {
             orderJson += "\"magicNumber\":" + (string)OrderMagicNumber(); // Last item
             orderJson += "}";
 
-            if (knownIndex == -1) { 
+            if (knownIndex == -1) {
                 SendTradeEvent("TRADE_TRANSACTION_ORDER_ADD", orderJson, "null");
                 AddKnownOrder(orderTicket, currentSL, currentTP, currentLots, orderType, orderSymbol);
                 if(ExtKnownOpenOrdersCount > 0 && (ExtKnownOpenOrdersCount-1) < ArraySize(currentKnownOrderFound)) {
-                    currentKnownOrderFound[ExtKnownOpenOrdersCount-1] = true; 
+                    currentKnownOrderFound[ExtKnownOpenOrdersCount-1] = true;
                 }
-            } else { 
+            } else {
                 if(knownIndex < ArraySize(currentKnownOrderFound)) currentKnownOrderFound[knownIndex] = true;
 
                 bool slTpModified = false;
@@ -377,11 +373,11 @@ void OnTick() {
                     NormalizeDouble(ExtKnownOpenOrders[knownIndex].tp, symDigits) != NormalizeDouble(currentTP, symDigits)) {
                      slTpModified = true;
                 }
-                
+
                 bool lotsModified = (MathAbs(ExtKnownOpenOrders[knownIndex].lots - currentLots) > MarketLotsStep(orderSymbol) * 0.1 );
 
                 if (slTpModified || lotsModified) {
-                    Print("SenderEA: Modification detected for ticket ", orderTicket, 
+                    Print("SenderEA: Modification detected for ticket ", orderTicket,
                           ": Old SL=", ExtKnownOpenOrders[knownIndex].sl, ", New SL=", currentSL,
                           ", Old TP=", ExtKnownOpenOrders[knownIndex].tp, ", New TP=", currentTP,
                           ", Old Lots=", ExtKnownOpenOrders[knownIndex].lots, ", New Lots=", currentLots);
@@ -398,7 +394,7 @@ void OnTick() {
         if (k < ArraySize(currentKnownOrderFound) && !currentKnownOrderFound[k]) {
             Print("SenderEA OnTick: Order #", ExtKnownOpenOrders[k].ticket, " (Symbol: ", ExtKnownOpenOrders[k].symbol,
                   ") from known list not found in current open orders. Removing from internal list (event should have been sent by history check).");
-            RemoveKnownOrderFromArray(k); 
+            RemoveKnownOrderFromArray(k);
         }
     }
 }
@@ -409,7 +405,7 @@ void OnTick() {
 void SendTradeEvent(string transactionType, string orderJson, string dealJson) {
     if (g_clientSocket == NULL || !g_clientSocket.IsSocketConnected() || !ExtIdentified) {
         Print("SenderEA: Cannot send trade event '", transactionType, "', not connected or not identified.");
-        if (g_clientSocket != NULL && !g_clientSocket.IsSocketConnected()) ExtIsConnected = false; 
+        if (g_clientSocket != NULL && !g_clientSocket.IsSocketConnected()) ExtIsConnected = false;
         return;
     }
 
@@ -419,19 +415,19 @@ void SendTradeEvent(string transactionType, string orderJson, string dealJson) {
     jsonPayload += "\"transactionType\":\"" + transactionType + "\",";
     jsonPayload += "\"timestamp\":" + DoubleToString(TimeCurrent() * 1000.0, 0) + ","; // Milliseconds
     jsonPayload += "\"order\":" + orderJson + ",";
-    jsonPayload += "\"deal\":" + dealJson; 
+    jsonPayload += "\"deal\":" + dealJson;
     jsonPayload += "}";
 
     string messageToSend = jsonPayload + "\n";
-    Print("SenderEA: Preparing Trade Event JSON: ", jsonPayload); 
-    Print("SenderEA: Sending event: ", transactionType); 
+    Print("SenderEA: Preparing Trade Event JSON: ", jsonPayload);
+    Print("SenderEA: Sending event: ", transactionType);
 
     if (!g_clientSocket.Send(messageToSend)) {
         Print("SenderEA: Failed to send trade event '", transactionType, "'. Error: ", g_clientSocket.GetLastSocketError());
         if (!g_clientSocket.IsSocketConnected()) {
             ExtIsConnected = false;
-            ExtIdentified = false; 
-            ExtLastOnTickProcessedTime = 0; 
+            ExtIdentified = false;
+            ExtLastOnTickProcessedTime = 0;
         }
     } else {
         // Print("SenderEA: Trade event '", transactionType, "' sent to buffer.");
@@ -449,7 +445,7 @@ int FindKnownOrderIndex(int ticket) {
 }
 
 void AddKnownOrder(int ticket, double sl, double tp, double lots, int orderTypeVal, string symbolStr) {
-    if (FindKnownOrderIndex(ticket) != -1) return; 
+    if (FindKnownOrderIndex(ticket) != -1) return;
 
     if (ExtKnownOpenOrdersCount < ArraySize(ExtKnownOpenOrders)) {
         ExtKnownOpenOrders[ExtKnownOpenOrdersCount].ticket = ticket;
@@ -489,7 +485,7 @@ int MarketLotsDigits(string symbol) {
     if (lotStep == 0.1) return 1;
     if (lotStep == 0.01) return 2;
     if (lotStep == 0.001) return 3;
-    return 2; 
+    return 2;
 }
 
 double MarketLotsStep(string symbol) {
