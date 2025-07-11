@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  copyserver:
+    build: .
+    container_name: mt4_copy_trade_server
+    ports:
+      - "3000:3000" # Map host port 3000 to container port 3000
+    volumes:
+      # Mount authorized_receiver_accounts.json to allow changes without rebuilding image
+      # Ensure the file exists in the same directory as docker-compose.yml on the host
+      - ./authorized_receiver_accounts.json:/usr/src/app/authorized_receiver_accounts.json:ro # :ro for read-only
+    restart: unless-stopped
+    # Optional: If you want to ensure the server only starts after a database (if you add one later)
+    # depends_on:
+    #   - your_database_service
+    networks:
+      - copytrade_network
+
+networks:
+  copytrade_network:
+    driver: bridge
+
+# To run: docker-compose up -d
+# To stop: docker-compose down
+# To view logs: docker-compose logs -f copyserver
