@@ -5,92 +5,22 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024, Your Name/Company"
 #property link      "https://example.com"
-#property version   "1.41" // Incremented version
+#property version   "1.52" // Version updated for millisecond timestamp (manual provision)
 #property strict
 
-//--- Include necessary libraries
-// #include <WinSock2.mqh> // Commented out as it might be causing "can't open include file" error
-                       // Necessary constants are defined below.
-
-//--- Defines for Winsock constants (if WinSock2.mqh is not used or missing them)
-#ifndef AF_INET
-#define AF_INET 2
-#endif
-#ifndef SOCK_STREAM
-#define SOCK_STREAM 1
-#endif
-#ifndef IPPROTO_TCP
-#define IPPROTO_TCP 6
-#endif
-#ifndef INVALID_SOCKET
-#define INVALID_SOCKET -1
-#endif
-#ifndef SOCKET_ERROR
-#define SOCKET_ERROR -1
-#endif
-#ifndef FIONBIO
-#define FIONBIO 0x8004667E
-#endif
-#ifndef WSAEWOULDBLOCK // Common Winsock error codes
-#define WSAEWOULDBLOCK 10035
-#endif
-#ifndef WSAEINPROGRESS
-#define WSAEINPROGRESS 10036
-#endif
-#ifndef WSAENOTCONN
-#define WSAENOTCONN    10057
-#endif
-#ifndef WSAECONNABORTED
-#define WSAECONNABORTED 10053
-#endif
-
-// For WSAStartup
-#ifndef WSADATA_SIZE_IN_INTS
-#define WSADATA_SIZE_IN_INTS 100
-#endif
-
-//--- Import ws2_32.dll functions
-#import "ws2_32.dll"
-int WSAStartup(ushort wVersionRequired, int &WSAData[]);
-int WSACleanup();
-int socket(int af, int type, int protocol);
-int closesocket(int s);
-int connect(int s, int &sockAddr[], int nameLen);
-int send(int s, uchar &buf[], int len, int flags);
-int recv(int s, uchar &buf[], int len, int flags);
-ushort htons(ushort hostshort);
-uint inet_addr(string cp);
-int WSAGetLastError();
-int ioctlsocket(int s, long cmd, int &argp);
-#import
-
-//--- Import kernel32.dll for CopyMemory
-#import "kernel32.dll"
-void CopyMemory(int &destination[], int &source[], int length);
-void CopyMemory(uchar &destination[], string source, int length);
-void CopyMemory(uchar &dest[], const string src, int n); // For StringToCharArray alternative if needed
-void ZeroMemory(int &block[], int size); // For sockaddr_in_DLL
-void ZeroMemory(char &block[], int size); // For sockaddr_in_DLL.sin_zero
-#import
-
-// Define sockaddr_in structure (16 bytes)
-struct sockaddr_in_DLL
-{
-  short  sin_family;
-  ushort sin_port;
-  uint   sin_addr;
-  char   sin_zero[8];
-};
+//--- Include new socket library
+#include <socket-library-mt4-mt5.mqh> // Assuming this is in MQL4/Include or same dir
 
 //--- Input parameters
-input string ServerAddress = "metaapi.gametrader.my";
+input string ServerAddress = "metaapi.gametrader.my"; // Can now be hostname or IP
 input int ServerPort = 3000;
 input string AccountIdentifier = "SenderAccount123";
 
 //--- Global variables
-int ExtSocketHandle = INVALID_SOCKET;
-bool ExtIsConnected = false;
-bool ExtIdentified = false;
+ClientSocket *g_clientSocket = NULL; // Use the ClientSocket class from the library
+
+bool ExtIsConnected = false; // EA's internal flag for connection status
+bool ExtIdentified = false;  // EA's internal flag for identification status
 datetime ExtLastHeartbeatSent = 0;
 int ExtHeartbeatInterval = 30;       // Seconds
 
@@ -107,35 +37,33 @@ int ExtKnownOpenOrdersCount = 0;
 int ExtLastHistoryTotal = 0;
 datetime ExtLastOnTickProcessedTime = 0;
 
+//+------------------------------------------------------------------+
+//| JSON String Escaping                                             |
+//+------------------------------------------------------------------+
 string EscapeJsonString(string text) {
     string result = "";
     int len = StringLen(text);
     for (int i = 0; i < len; i++) {
         char ch = StringGetCharacter(text, i);
         switch (ch) {
-            case '\\': result += "\\\\"; break;
-            case '"':  result += "\\\""; break;
-            case '\b': result += "\\b"; break;
-            case '\f': result += "\\f"; break;
-            case '\n': result += "\\n"; break;
-            case '\r': result += "\\r"; break;
-            case '\t': result += "\\t"; break;
+            case '\\': result += "\\\\"; break; 
+            case '"':  result += "\\\""; break; 
+            case 8:    result += "\\b";  break;  // Backspace
+            case 12:   result += "\\f";  break;  // Form feed
+            case 10:   result += "\\n";  break;  // Newline
+            case 13:   result += "\\r";  break;  // Carriage return
+            case 9:    result += "\\t";  break;  // Tab
             default:
-                if (ch < 32) {
+                if (ch < 32 || ch == 127) { 
                     string temp;
-                    StringAppend(temp, "\\u"); // MQL4 doesn't have direct uXXXX, this is illustrative
-                                             // For actual control chars, might need specific handling or ignore
+                    temp = "\\u00"; 
                     int h1 = ch / 16;
                     int h2 = ch % 16;
-                    StringAppend(temp, h1<10? (string)h1 : CharToStr((char)('A'+h1-10)) );
-                    StringAppend(temp, h2<10? (string)h2 : CharToStr((char)('A'+h2-10)) );
-                    // This is a simplified hex, proper \\uXXXX needs 4 hex digits.
-                    // For MQL4 JSON, often best to avoid complex control chars or filter them.
-                    // For now, just pass through if not one of the common escapes.
-                    result += CharToStr(ch);
-
+                    temp += (h1 < 10 ? (string)h1 : CharToStr((char)('A' + h1 - 10)));
+                    temp += (h2 < 10 ? (string)h2 : CharToStr((char)('A' + h2 - 10)));
+                    result += temp;
                 } else {
-                    result += CharToStr(ch);
+                    result += CharToStr(ch); 
                 }
         }
     }
@@ -146,18 +74,10 @@ string EscapeJsonString(string text) {
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit() {
-    int wsaData[WSADATA_SIZE_IN_INTS];
-    ushort wVersionRequired = 0x0202;
-    int error = WSAStartup(wVersionRequested, wsaData);
-    if (error != 0) {
-        Print("SenderEA: WSAStartup failed with error: ", error, " (WSAGetLastError: ", WSAGetLastError(), ")");
-        return(INIT_FAILED);
-    }
-
-    EventSetTimer(1);
+    EventSetTimer(1); 
     Print("SenderEA: Initialized. AccountIdentifier: ", AccountIdentifier);
     ExtLastOnTickProcessedTime = 0;
-    ArrayResize(ExtKnownOpenOrders, 200);
+    ArrayResize(ExtKnownOpenOrders, 200); 
     return(INIT_SUCCEEDED);
 }
 
@@ -166,14 +86,14 @@ int OnInit() {
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
     EventKillTimer();
-    if (ExtSocketHandle != INVALID_SOCKET) {
-        Print("SenderEA: Closing socket connection (", ExtSocketHandle, ")");
-        closesocket(ExtSocketHandle);
-        ExtSocketHandle = INVALID_SOCKET;
+    Print("SenderEA: Deinitializing...");
+    if (g_clientSocket != NULL) {
+        Print("SenderEA: Closing socket connection.");
+        delete g_clientSocket;
+        g_clientSocket = NULL;
     }
     ExtIsConnected = false;
     ExtIdentified = false;
-    WSACleanup();
     Print("SenderEA: Deinitialized. Reason: ", reason);
 }
 
@@ -181,40 +101,63 @@ void OnDeinit(const int reason) {
 //| Timer function (for heartbeats and connection management)        |
 //+------------------------------------------------------------------+
 void OnTimer() {
-    if (!ExtIsConnected || ExtSocketHandle == INVALID_SOCKET) {
-        if (ConnectToServer()) {
-            Print("SenderEA Timer: Connection attempt successful/in progress.");
+    //--- Connection Management ---
+    if (g_clientSocket == NULL || !g_clientSocket.IsSocketConnected()) {
+        ExtIsConnected = false; 
+        ExtIdentified = false;  
+        ExtLastOnTickProcessedTime = 0; 
+        
+        Print("SenderEA Timer: Not connected. Attempting to connect...");
+        if (ConnectToServer()) { 
+            Print("SenderEA Timer: Connection attempt successful.");
         } else {
-            return;
+            Print("SenderEA Timer: Connection attempt failed. Will retry on next timer tick.");
+            return; 
         }
     }
 
-    if (ExtIsConnected && ExtSocketHandle != INVALID_SOCKET && !ExtIdentified) {
+    //--- Identification ---
+    if (ExtIsConnected && !ExtIdentified) {
+        Print("SenderEA Timer: Connected, attempting identification...");
         if (SendIdentification()) {
-            ExtIdentified = true;
+            ExtIdentified = true; 
             Print("SenderEA Timer: Identification successful. Initializing order states.");
-            InitializeOrderStates();
+            InitializeOrderStates(); 
         } else {
-            return;
+            Print("SenderEA Timer: Identification failed. Will retry on next timer tick if still connected.");
+            return; 
         }
     }
 
-    if (ExtIsConnected && ExtSocketHandle != INVALID_SOCKET && ExtIdentified && (TimeCurrent() - ExtLastHeartbeatSent >= ExtHeartbeatInterval)) {
-        string currentSenderAccountId = AccountIdentifier;
-        string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + currentSenderAccountId + "\",\"timestamp\":" + (string)TimeCurrent() + "}";
-        uchar sendBuffer[];
-        StringToCharArray(heartbeatMsg + "\n", sendBuffer, 0, -1, CP_UTF8);
-        int len = ArraySize(sendBuffer) -1;
+    //--- Heartbeat ---
+    if (ExtIsConnected && ExtIdentified && (TimeCurrent() - ExtLastHeartbeatSent >= ExtHeartbeatInterval)) {
+        string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + AccountIdentifier + "\",\"timestamp\":" + DoubleToString(TimeCurrent() * 1000.0, 0) + "}"; // Milliseconds
+        string msgWithNewline = heartbeatMsg + "\n";
+        
+        Print("SenderEA: Preparing Heartbeat JSON: ", heartbeatMsg); 
 
-        if (len > 0 && send(ExtSocketHandle, sendBuffer, len, 0) <= 0) {
-            Print("SenderEA: Failed to send heartbeat to account '",currentSenderAccountId,"'. Error: ", WSAGetLastError());
-            closesocket(ExtSocketHandle);
-            ExtSocketHandle = INVALID_SOCKET;
-            ExtIsConnected = false;
-            ExtIdentified = false;
-            ExtLastOnTickProcessedTime = 0;
-        } else if (len > 0) {
-            ExtLastHeartbeatSent = TimeCurrent();
+        Print("SenderEA Timer: Sending heartbeat...");
+        if (g_clientSocket != NULL && g_clientSocket.Send(msgWithNewline)) {
+            if (g_clientSocket.IsSocketConnected()) { 
+                ExtLastHeartbeatSent = TimeCurrent();
+            } else {
+                Print("SenderEA Timer: Heartbeat send attempted, but socket disconnected during/after send. Error: ", g_clientSocket.GetLastSocketError());
+                ExtIsConnected = false;
+                ExtIdentified = false;
+            }
+        } else {
+            Print("SenderEA Timer: Failed to send heartbeat.");
+            if (g_clientSocket != NULL) {
+                 Print("SenderEA Timer: Heartbeat send error: ", g_clientSocket.GetLastSocketError());
+                 if (!g_clientSocket.IsSocketConnected()){ 
+                    ExtIsConnected = false;
+                    ExtIdentified = false;
+                 }
+            } else {
+                Print("SenderEA Timer: Heartbeat send failed, socket object is NULL.");
+                ExtIsConnected = false; 
+                ExtIdentified = false;
+            }
         }
     }
 }
@@ -223,105 +166,70 @@ void OnTimer() {
 //| Connect to server function                                       |
 //+------------------------------------------------------------------+
 bool ConnectToServer() {
-    if (ExtIsConnected && ExtSocketHandle != INVALID_SOCKET && ExtIdentified) {
+    if (g_clientSocket != NULL) {
+        Print("SenderEA: Cleaning up previous socket instance before reconnecting.");
+        delete g_clientSocket;
+        g_clientSocket = NULL;
+    }
+    ExtIsConnected = false; 
+    ExtIdentified = false;  
+
+    Print("SenderEA: Attempting to connect to ", ServerAddress, ":", ServerPort, "...");
+    g_clientSocket = new ClientSocket(ServerAddress, ServerPort);
+
+    if (g_clientSocket == NULL) {
+        Print("SenderEA: Failed to allocate ClientSocket object memory.");
+        return false;
+    }
+
+    if (g_clientSocket.IsSocketConnected()) {
+        Print("SenderEA: Successfully connected to server.");
+        ExtIsConnected = true; 
         return true;
-    }
-    if(ExtSocketHandle != INVALID_SOCKET) {
-        closesocket(ExtSocketHandle);
-        ExtSocketHandle = INVALID_SOCKET;
-    }
-    ExtIsConnected = false;
-    ExtIdentified = false;
-
-    ExtSocketHandle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (ExtSocketHandle == INVALID_SOCKET) {
-        Print("SenderEA: Failed to create socket. Error: ", WSAGetLastError());
-        return false;
-    }
-
-    int nonBlocking = 1;
-    int argp = nonBlocking;
-    if (ioctlsocket(ExtSocketHandle, FIONBIO, argp) != 0) {
-       Print("SenderEA: ioctlsocket failed to set non-blocking. Error: ", WSAGetLastError());
-       closesocket(ExtSocketHandle);
-       ExtSocketHandle = INVALID_SOCKET;
-       return false;
-    }
-
-    sockaddr_in_DLL serverAddrStructLocal; // Use a local variable
-    // ZeroMemory for struct needs to be careful with MQL4 types
-    // For a struct, it's safer to initialize members directly or use a helper
-    int serverAddr_int[sizeof(sockaddr_in_DLL)/sizeof(int)];
-    ZeroMemory(serverAddr_int, sizeof(sockaddr_in_DLL)); // Zero out the int array
-
-    serverAddrStructLocal.sin_family = AF_INET;
-    serverAddrStructLocal.sin_port = htons(ServerPort);
-    serverAddrStructLocal.sin_addr = inet_addr(ServerAddress);
-
-    if (serverAddrStructLocal.sin_addr == 0xFFFFFFFF || serverAddrStructLocal.sin_addr == 0) {
-        Print("SenderEA: inet_addr failed for ServerAddress: ", ServerAddress,". Please use a valid IPv4 address.");
-        closesocket(ExtSocketHandle);
-        ExtSocketHandle = INVALID_SOCKET;
-        return false;
-    }
-
-    CopyMemory(serverAddr_int, serverAddrStructLocal, sizeof(sockaddr_in_DLL));
-
-    int connectResult = connect(ExtSocketHandle, serverAddr_int, sizeof(sockaddr_in_DLL));
-
-    if (connectResult == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
-             Print("SenderEA: Failed to connect to server ", ServerAddress, ":", ServerPort, ". Error: ", err);
-             closesocket(ExtSocketHandle);
-             ExtSocketHandle = INVALID_SOCKET;
-             return false;
-        }
-        Print("SenderEA: Connection attempt in progress (non-blocking) to ", ServerAddress, ":", ServerPort, ". Error code (if any): ", err);
     } else {
-         Print("SenderEA: Connect call returned success immediately.");
+        Print("SenderEA: Failed to connect to server. Error: ", g_clientSocket.GetLastSocketError());
+        delete g_clientSocket; 
+        g_clientSocket = NULL;
+        return false;
     }
-
-    ExtIsConnected = true;
-    return true;
 }
 
 //+------------------------------------------------------------------+
 //| Send Identification Message                                      |
 //+------------------------------------------------------------------+
 bool SendIdentification() {
-    if (ExtSocketHandle == INVALID_SOCKET || !ExtIsConnected) {
-         Print("SenderEA: Cannot send identification, socket not valid or connection not initiated.");
+    if (g_clientSocket == NULL || !g_clientSocket.IsSocketConnected()) {
+         Print("SenderEA: Cannot send identification, not connected.");
+         ExtIsConnected = false; 
+         ExtIdentified = false;
          return false;
     }
 
     string identMsg = "{\"type\":\"identification\",\"role\":\"sender\",\"accountId\":\"" + AccountIdentifier + "\"}";
-    uchar sendBufferIdent[];
-    StringToCharArray(identMsg + "\n", sendBufferIdent, 0, -1, CP_UTF8);
-    int identLen = ArraySize(sendBufferIdent) -1;
+    string msgWithNewline = identMsg + "\n";
 
-    if (identLen <=0) {
-        Print("SenderEA: Identification message is empty.");
-        return false;
-    }
-
-    int sentBytes = send(ExtSocketHandle, sendBufferIdent, identLen, 0);
-    if (sentBytes <= 0) {
-        int sendError = WSAGetLastError();
-        Print("SenderEA: Failed to send identification message. Error: ", sendError);
-        if (sendError != WSAEWOULDBLOCK && sendError != WSAENOTCONN && sendError != WSAECONNABORTED) {
-            closesocket(ExtSocketHandle);
-            ExtSocketHandle = INVALID_SOCKET;
-            ExtIsConnected = false;
+    Print("SenderEA: Preparing Identification JSON: ", identMsg); 
+    
+    Print("SenderEA: Sending identification message...");
+    if (g_clientSocket.Send(msgWithNewline)) {
+        if (g_clientSocket.IsSocketConnected()) { 
+            Print("SenderEA: Identification message sent successfully.");
+            ExtLastHeartbeatSent = TimeCurrent(); 
+            return true;
+        } else {
+            Print("SenderEA: Identification send attempted, but socket disconnected. Error: ", g_clientSocket.GetLastSocketError());
+            ExtIsConnected = false; 
             ExtIdentified = false;
             return false;
         }
-        Print("SenderEA: Identification send pending (Error: ",sendError,"), connection likely not fully established yet.");
+    } else {
+        Print("SenderEA: Failed to send identification message. Error: ", g_clientSocket.GetLastSocketError());
+        if (!g_clientSocket.IsSocketConnected()) { 
+            ExtIsConnected = false;
+            ExtIdentified = false;
+        }
         return false;
     }
-    Print("SenderEA: Identification message appears sent (or queued by OS).");
-    ExtLastHeartbeatSent = TimeCurrent();
-    return true;
 }
 
 //+------------------------------------------------------------------+
@@ -329,8 +237,6 @@ bool SendIdentification() {
 //+------------------------------------------------------------------+
 void InitializeOrderStates() {
     ExtKnownOpenOrdersCount = 0;
-    // ArrayResize(ExtKnownOpenOrders, 200); // Already sized
-
     for (int i = OrdersTotal() - 1; i >= 0; i--) {
         if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
             if (ExtKnownOpenOrdersCount < ArraySize(ExtKnownOpenOrders)) {
@@ -349,43 +255,51 @@ void InitializeOrderStates() {
     }
     ExtLastHistoryTotal = HistoryTotal();
     Print("SenderEA: Initial order states captured. Open orders tracked: ", ExtKnownOpenOrdersCount, ". HistoryTotal: ", ExtLastHistoryTotal);
-    ExtLastOnTickProcessedTime = TimeCurrent();
+    ExtLastOnTickProcessedTime = TimeCurrent(); 
 }
 
 
 //+------------------------------------------------------------------+
-//| OnTick function (primary place for MQL4 trade detection)         |
+//| OnTick function                                                  |
 //+------------------------------------------------------------------+
 void OnTick() {
-    if (!ExtIsConnected || ExtSocketHandle == INVALID_SOCKET || !ExtIdentified) {
+    if (!ExtIsConnected || !ExtIdentified || g_clientSocket == NULL || !g_clientSocket.IsSocketConnected()) {
+        if(ExtIsConnected || ExtIdentified){ 
+            Print("SenderEA OnTick: Discrepancy in connection/identification state. Socket Connected: ", (g_clientSocket!=NULL && g_clientSocket.IsSocketConnected()), " ExtIsConnected: ", ExtIsConnected, " ExtIdentified: ", ExtIdentified);
+            ExtIsConnected = false;
+            ExtIdentified = false;
+        }
         ExtLastOnTickProcessedTime = 0;
         return;
     }
 
     if (ExtLastOnTickProcessedTime == 0) {
-         InitializeOrderStates();
-         if(ExtKnownOpenOrdersCount == 0 && OrdersTotal() == 0 && HistoryTotal() == ExtLastHistoryTotal) {
-             ExtLastOnTickProcessedTime = TimeCurrent();
+         InitializeOrderStates(); 
+         if(ExtLastOnTickProcessedTime == 0) { 
+            Print("SenderEA OnTick: ExtLastOnTickProcessedTime is still 0 after expected init. Re-initializing.");
+            InitializeOrderStates();
+            if(ExtLastOnTickProcessedTime == 0) { 
+                Print("SenderEA OnTick: Critical - could not initialize order states time. Aborting tick.");
+                return;
+            }
          }
-         // If still 0 after init, means init didn't complete or no orders
-         if(ExtLastOnTickProcessedTime == 0) return;
     }
-
+    
     // --- Detect Closed Orders by iterating history ---
     if (HistoryTotal() > ExtLastHistoryTotal) {
         for (int i = ExtLastHistoryTotal; i < HistoryTotal(); i++) {
             if (OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) {
-                if (OrderType() == OP_BUY || OrderType() == OP_SELL) {
+                if (OrderType() == OP_BUY || OrderType() == OP_SELL) { 
                     int knownIndex = FindKnownOrderIndex(OrderTicket());
-                    if (knownIndex != -1) {
+                    if (knownIndex != -1) { 
                         string orderSymbol = OrderSymbol();
-                        int symDigits = MarketInfo(orderSymbol, MODE_DIGITS);
+                        int symDigits = (int)SymbolInfoInteger(orderSymbol, SYMBOL_DIGITS);
 
                         string orderJson = "{";
                         orderJson += "\"ticket\":" + (string)OrderTicket() + ",";
                         orderJson += "\"symbol\":\"" + EscapeJsonString(orderSymbol) + "\",";
                         orderJson += "\"type\":" + (string)OrderType() + ",";
-                        orderJson += "\"lots\":" + DoubleToString(OrderLots(), symDigits) + ",";
+                        orderJson += "\"lots\":" + DoubleToString(OrderLots(), MarketLotsDigits(orderSymbol)) + ",";
                         orderJson += "\"openPrice\":" + DoubleToString(OrderOpenPrice(), symDigits) + ",";
                         orderJson += "\"openTime\":\"" + TimeToString(OrderOpenTime(), TIME_DATE|TIME_SECONDS) + "\",";
                         orderJson += "\"stopLoss\":" + DoubleToString(OrderStopLoss(), symDigits) + ",";
@@ -396,17 +310,17 @@ void OnTick() {
                         orderJson += "\"swap\":" + DoubleToString(OrderSwap(), 2) + ",";
                         orderJson += "\"profit\":" + DoubleToString(OrderProfit(), 2) + ",";
                         orderJson += "\"comment\":\"" + EscapeJsonString(OrderComment()) + "\",";
-                        orderJson += "\"magicNumber\":" + (string)OrderMagicNumber();
+                        orderJson += "\"magicNumber\":" + (string)OrderMagicNumber(); // Last item
                         orderJson += "}";
 
-                        string dealJson = "{";
+                        string dealJson = "{"; 
                         dealJson += "\"order\":" + (string)OrderTicket() + ",";
-                        dealJson += "\"entry\":\"DEAL_ENTRY_OUT\",";
-                        dealJson += "\"lots\":" + DoubleToString(OrderLots(), symDigits) + "";
+                        dealJson += "\"entry\":\"DEAL_ENTRY_OUT\","; 
+                        dealJson += "\"lots\":" + DoubleToString(OrderLots(), MarketLotsDigits(orderSymbol)); // Last item
                         dealJson += "}";
 
                         SendTradeEvent("TRADE_TRANSACTION_DEAL", orderJson, dealJson);
-                        RemoveKnownOrder(OrderTicket());
+                        RemoveKnownOrder(OrderTicket()); 
                     }
                 }
             }
@@ -414,16 +328,15 @@ void OnTick() {
     }
     ExtLastHistoryTotal = HistoryTotal();
 
-    // --- Detect New Orders & Modifications for currently open orders ---
-    bool currentKnownOrderFound[200];
+    bool currentKnownOrderFound[200]; 
     if(ArraySize(ExtKnownOpenOrders) > 0) ArrayInitialize(currentKnownOrderFound, false);
 
     for (int i = 0; i < OrdersTotal(); i++) {
         if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
             int orderTicket = OrderTicket();
             string orderSymbol = OrderSymbol();
-            int symDigits = MarketInfo(orderSymbol, MODE_DIGITS);
-            double symPoint = MarketInfo(orderSymbol, MODE_POINT);
+            int symDigits = (int)SymbolInfoInteger(orderSymbol, SYMBOL_DIGITS);
+            // double symPoint = SymbolInfoDouble(orderSymbol, SYMBOL_POINT); // Not used here
 
             double currentSL = OrderStopLoss();
             double currentTP = OrderTakeProfit();
@@ -436,40 +349,40 @@ void OnTick() {
             orderJson += "\"ticket\":" + (string)orderTicket + ",";
             orderJson += "\"symbol\":\"" + EscapeJsonString(orderSymbol) + "\",";
             orderJson += "\"type\":" + (string)orderType + ",";
-            orderJson += "\"lots\":" + DoubleToString(currentLots, symDigits) + ",";
+            orderJson += "\"lots\":" + DoubleToString(currentLots, MarketLotsDigits(orderSymbol)) + ",";
             orderJson += "\"openPrice\":" + DoubleToString(OrderOpenPrice(), symDigits) + ",";
             orderJson += "\"openTime\":\"" + TimeToString(OrderOpenTime(), TIME_DATE|TIME_SECONDS) + "\",";
             orderJson += "\"stopLoss\":" + DoubleToString(currentSL, symDigits) + ",";
             orderJson += "\"takeProfit\":" + DoubleToString(currentTP, symDigits) + ",";
-            orderJson += "\"closePrice\":0,";
+            orderJson += "\"closePrice\":0,"; 
             orderJson += "\"closeTime\":0,";
             orderJson += "\"commission\":" + DoubleToString(OrderCommission(), 2) + ",";
             orderJson += "\"swap\":" + DoubleToString(OrderSwap(), 2) + ",";
             orderJson += "\"profit\":" + DoubleToString(OrderProfit(), 2) + ",";
             orderJson += "\"comment\":\"" + EscapeJsonString(OrderComment()) + "\",";
-            orderJson += "\"magicNumber\":" + (string)OrderMagicNumber();
+            orderJson += "\"magicNumber\":" + (string)OrderMagicNumber(); // Last item
             orderJson += "}";
 
-            if (knownIndex == -1) {
+            if (knownIndex == -1) { 
                 SendTradeEvent("TRADE_TRANSACTION_ORDER_ADD", orderJson, "null");
                 AddKnownOrder(orderTicket, currentSL, currentTP, currentLots, orderType, orderSymbol);
-                 if(ExtKnownOpenOrdersCount > 0 && (ExtKnownOpenOrdersCount-1) < ArraySize(currentKnownOrderFound))
-                    currentKnownOrderFound[ExtKnownOpenOrdersCount-1] = true;
-            } else {
+                if(ExtKnownOpenOrdersCount > 0 && (ExtKnownOpenOrdersCount-1) < ArraySize(currentKnownOrderFound)) {
+                    currentKnownOrderFound[ExtKnownOpenOrdersCount-1] = true; 
+                }
+            } else { 
                 if(knownIndex < ArraySize(currentKnownOrderFound)) currentKnownOrderFound[knownIndex] = true;
 
                 bool slTpModified = false;
-                if (MathAbs(ExtKnownOpenOrders[knownIndex].sl - currentSL) > symPoint * 0.1 ||
-                    MathAbs(ExtKnownOpenOrders[knownIndex].tp - currentTP) > symPoint * 0.1 ) {
-                    if (! (ExtKnownOpenOrders[knownIndex].sl == 0 && currentSL == 0 && ExtKnownOpenOrders[knownIndex].tp == 0 && currentTP == 0) ) {
-                         slTpModified = true;
-                    }
+                if (NormalizeDouble(ExtKnownOpenOrders[knownIndex].sl, symDigits) != NormalizeDouble(currentSL, symDigits) ||
+                    NormalizeDouble(ExtKnownOpenOrders[knownIndex].tp, symDigits) != NormalizeDouble(currentTP, symDigits)) {
+                     slTpModified = true;
                 }
-
-                bool lotsModified = (MathAbs(ExtKnownOpenOrders[knownIndex].lots - currentLots) > 0.0000001);
+                
+                bool lotsModified = (MathAbs(ExtKnownOpenOrders[knownIndex].lots - currentLots) > MarketLotsStep(orderSymbol) * 0.1 );
 
                 if (slTpModified || lotsModified) {
-                    Print("SenderEA: Modification detected for ticket ", orderTicket, ": Old SL=", ExtKnownOpenOrders[knownIndex].sl, ", New SL=", currentSL,
+                    Print("SenderEA: Modification detected for ticket ", orderTicket, 
+                          ": Old SL=", ExtKnownOpenOrders[knownIndex].sl, ", New SL=", currentSL,
                           ", Old TP=", ExtKnownOpenOrders[knownIndex].tp, ", New TP=", currentTP,
                           ", Old Lots=", ExtKnownOpenOrders[knownIndex].lots, ", New Lots=", currentLots);
                     SendTradeEvent("TRADE_TRANSACTION_ORDER_UPDATE", orderJson, "null");
@@ -483,13 +396,9 @@ void OnTick() {
 
     for (int k = ExtKnownOpenOrdersCount - 1; k >= 0; k--) {
         if (k < ArraySize(currentKnownOrderFound) && !currentKnownOrderFound[k]) {
-            // This order was in ExtKnownOpenOrders but was not found in the current OrdersTotal() scan.
-            // It implies the order was closed. The history check should ideally capture this.
-            // This is a fallback to remove it from the known list.
-            // To avoid sending duplicate close events, we rely on history check to send the actual event.
-            Print("SenderEA: Order ", ExtKnownOpenOrders[k].ticket, " (Symbol: ", ExtKnownOpenOrders[k].symbol,
-                  ") from known list not found in current open orders scan. Removing from known list.");
-            RemoveKnownOrderFromArray(k);
+            Print("SenderEA OnTick: Order #", ExtKnownOpenOrders[k].ticket, " (Symbol: ", ExtKnownOpenOrders[k].symbol,
+                  ") from known list not found in current open orders. Removing from internal list (event should have been sent by history check).");
+            RemoveKnownOrderFromArray(k); 
         }
     }
 }
@@ -498,8 +407,9 @@ void OnTick() {
 //| Send Trade Event to Server                                       |
 //+------------------------------------------------------------------+
 void SendTradeEvent(string transactionType, string orderJson, string dealJson) {
-    if (!ExtIsConnected || ExtSocketHandle == INVALID_SOCKET || !ExtIdentified) {
-        Print("SenderEA: Not connected or not identified, cannot send trade event '", transactionType, "'");
+    if (g_clientSocket == NULL || !g_clientSocket.IsSocketConnected() || !ExtIdentified) {
+        Print("SenderEA: Cannot send trade event '", transactionType, "', not connected or not identified.");
+        if (g_clientSocket != NULL && !g_clientSocket.IsSocketConnected()) ExtIsConnected = false; 
         return;
     }
 
@@ -507,30 +417,24 @@ void SendTradeEvent(string transactionType, string orderJson, string dealJson) {
     jsonPayload += "\"type\":\"tradeEvent\",";
     jsonPayload += "\"accountId\":\"" + AccountIdentifier + "\",";
     jsonPayload += "\"transactionType\":\"" + transactionType + "\",";
-    jsonPayload += "\"timestamp\":" + (string)TimeCurrent() + ",";
+    jsonPayload += "\"timestamp\":" + DoubleToString(TimeCurrent() * 1000.0, 0) + ","; // Milliseconds
     jsonPayload += "\"order\":" + orderJson + ",";
-    jsonPayload += "\"deal\":" + dealJson;
+    jsonPayload += "\"deal\":" + dealJson; 
     jsonPayload += "}";
 
     string messageToSend = jsonPayload + "\n";
-    Print("SenderEA: Sending event: ", messageToSend);
+    Print("SenderEA: Preparing Trade Event JSON: ", jsonPayload); 
+    Print("SenderEA: Sending event: ", transactionType); 
 
-    uchar sendBuffer[];
-    StringToCharArray(messageToSend, sendBuffer, 0, -1, CP_UTF8);
-    int len = ArraySize(sendBuffer) -1;
-
-    if (len <= 0) {
-        Print("SenderEA: Cannot send empty message for event ", transactionType);
-        return;
-    }
-
-    if (send(ExtSocketHandle, sendBuffer, len, 0) <= 0) {
-        Print("SenderEA: Failed to send trade event '", transactionType, "'. Error: ", WSAGetLastError());
-        closesocket(ExtSocketHandle);
-        ExtSocketHandle = INVALID_SOCKET;
-        ExtIsConnected = false;
-        ExtIdentified = false;
-        ExtLastOnTickProcessedTime = 0;
+    if (!g_clientSocket.Send(messageToSend)) {
+        Print("SenderEA: Failed to send trade event '", transactionType, "'. Error: ", g_clientSocket.GetLastSocketError());
+        if (!g_clientSocket.IsSocketConnected()) {
+            ExtIsConnected = false;
+            ExtIdentified = false; 
+            ExtLastOnTickProcessedTime = 0; 
+        }
+    } else {
+        // Print("SenderEA: Trade event '", transactionType, "' sent to buffer.");
     }
 }
 
@@ -545,17 +449,17 @@ int FindKnownOrderIndex(int ticket) {
 }
 
 void AddKnownOrder(int ticket, double sl, double tp, double lots, int orderTypeVal, string symbolStr) {
+    if (FindKnownOrderIndex(ticket) != -1) return; 
+
     if (ExtKnownOpenOrdersCount < ArraySize(ExtKnownOpenOrders)) {
-        if (FindKnownOrderIndex(ticket) == -1) {
-            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].ticket = ticket;
-            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].sl = sl;
-            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].tp = tp;
-            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].lots = lots;
-            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].type = orderTypeVal;
-            ExtKnownOpenOrders[ExtKnownOpenOrdersCount].symbol = symbolStr;
-            ExtKnownOpenOrdersCount++;
-            Print("SenderEA: Added to known orders: #", ticket, " ", symbolStr, " Type:", EnumToString(orderTypeVal), " Lots:", lots, " SL:", sl, " TP:",tp);
-        }
+        ExtKnownOpenOrders[ExtKnownOpenOrdersCount].ticket = ticket;
+        ExtKnownOpenOrders[ExtKnownOpenOrdersCount].sl = sl;
+        ExtKnownOpenOrders[ExtKnownOpenOrdersCount].tp = tp;
+        ExtKnownOpenOrders[ExtKnownOpenOrdersCount].lots = lots;
+        ExtKnownOpenOrders[ExtKnownOpenOrdersCount].type = orderTypeVal;
+        ExtKnownOpenOrders[ExtKnownOpenOrdersCount].symbol = symbolStr;
+        ExtKnownOpenOrdersCount++;
+        Print("SenderEA: Added to known orders: #", ticket, " ", symbolStr);
     } else {
         Print("SenderEA: Known open orders array is full. Cannot add ticket: ", ticket);
     }
@@ -567,7 +471,9 @@ void RemoveKnownOrderFromArray(int index) {
     for (int i = index; i < ExtKnownOpenOrdersCount - 1; i++) {
         ExtKnownOpenOrders[i] = ExtKnownOpenOrders[i+1];
     }
-    if (ExtKnownOpenOrdersCount > 0) ExtKnownOpenOrdersCount--;
+    if (ExtKnownOpenOrdersCount > 0) {
+      ExtKnownOpenOrdersCount--;
+    }
 }
 
 void RemoveKnownOrder(int ticket) {
@@ -577,21 +483,17 @@ void RemoveKnownOrder(int ticket) {
     }
 }
 
-string StringSubst(string text, string findStr, string replaceStr) {
-    string result = text;
-    if (StringLen(findStr) == 0) return text;
+int MarketLotsDigits(string symbol) {
+    double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+    if (lotStep == 1.0) return 0;
+    if (lotStep == 0.1) return 1;
+    if (lotStep == 0.01) return 2;
+    if (lotStep == 0.001) return 3;
+    return 2; 
+}
 
-    int findLen = StringLen(findStr);
-    int replaceLen = StringLen(replaceStr);
-    int pos = StringFind(result, findStr, 0);
-
-    while (pos != -1) {
-        string part1 = StringSubstr(result, 0, pos);
-        string part2 = StringSubstr(result, pos + findLen);
-        result = part1 + replaceStr + part2;
-        pos = StringFind(result, findStr, pos + replaceLen);
-    }
-    return result;
+double MarketLotsStep(string symbol) {
+    return SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
 }
 
 string EnumToString(int enum_value) {
@@ -606,23 +508,3 @@ string EnumToString(int enum_value) {
     }
 }
 //+------------------------------------------------------------------+
-```
-
-I have made the following changes in this full version:
--   **Commented out `#include <WinSock2.mqh>`:** And defined necessary constants (`AF_INET`, `SOCK_STREAM`, `IPPROTO_TCP`, `INVALID_SOCKET`, `SOCKET_ERROR`, `FIONBIO`, `WSAEWOULDBLOCK`, etc.) directly in the file. This should resolve the "can't open include file" error if `WinSock2.mqh` is missing or problematic in your environment.
--   **Corrected DLL Import Signatures:**
-    *   `send` and `recv`: Changed buffer parameter to `uchar &buf[]` to correctly pass by reference for modification.
-    *   `connect`: Changed `sockaddr` parameter to `int &sockAddr[]` to reflect passing the structure as an integer array by reference.
-    *   `WSAStartup`: `WSAData` parameter is `int &WSAData[]`.
-    *   `ioctlsocket`: `argp` is `int &argp`.
--   **`CopyMemory` Imports:** Added necessary imports for `CopyMemory` from `kernel32.dll` for different use cases (int array to int array, string to uchar array). Added `ZeroMemory` for initializing `sockaddr_in_DLL` via an int array.
--   **`OrderDigits()` Replacement:** Replaced all instances of `OrderDigits()` with `MarketInfo(OrderSymbol(), MODE_DIGITS)` or simply `Digits` (if `OrderSymbol()` is already available in context).
--   **Array Initialization:** Ensured `currentKnownOrderFound` array is initialized using `ArrayInitialize(currentKnownOrderFound, false);` before its use in loops.
--   **`send()` parameters:** Ensured `StringToCharArray` is used to populate the `uchar` buffer and `ArraySize(buffer) - 1` is used for the length to exclude the null terminator. Added `CP_UTF8` for encoding.
--   **`inet_addr` return type:** Confirmed `uint` for `inet_addr`.
--   **`sockaddr_in_DLL` Zeroing:** Used `ZeroMemory` on the `int` array version of `sockaddr_in_DLL` before populating it.
--   **JSON Escaping:** Included the `EscapeJsonString` function and used it for `OrderSymbol()` and `OrderComment()` when building JSON strings to prevent issues with special characters.
--   **Refined Connection/Identification Logic:** Made the connection and identification attempts primarily driven by `OnTimer` to prevent `OnTick` from being blocked or spamming. `OnTick` now checks if connected and identified before proceeding with trade detection. `InitializeOrderStates` is called after successful identification.
-
-Please replace the entire content of your `SenderEA.mq4` with this code. I am hopeful this will compile successfully and address the previous issues.
-I sincerely apologize for the multiple attempts and the errors. This has highlighted areas I need to improve in handling complex code generation and state.
