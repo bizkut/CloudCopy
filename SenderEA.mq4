@@ -131,9 +131,8 @@ void OnTimer() {
         string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + AccountIdentifier + "\",\"timestamp\":" + DoubleToString(TimeCurrent() * 1000.0, 0) + "}";
         string msgWithNewline = heartbeatMsg + "\n";
 
-        Print("SenderEA: Preparing Heartbeat JSON: ", heartbeatMsg);
-
-        Print("SenderEA Timer: Sending heartbeat...");
+        // Print("SenderEA: Preparing Heartbeat JSON: ", heartbeatMsg); // Commented out for quieter logs
+        // Print("SenderEA Timer: Sending heartbeat..."); // Commented out for quieter logs
         if (g_clientSocket != NULL && g_clientSocket.Send(msgWithNewline)) {
             if (g_clientSocket.IsSocketConnected()) {
                 ExtLastHeartbeatSent = TimeCurrent();

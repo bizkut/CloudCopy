@@ -73,7 +73,7 @@ void OnTimer() {
         string heartbeatMsg = "{\"type\":\"heartbeat\",\"accountId\":\"" + currentReceiverMT4AccountId + "\",\"timestamp\":" + DoubleToString(TimeCurrent() * 1000.0, 0) + "}"; // Milliseconds
         string msgWithNewline = heartbeatMsg + "\n";
 
-        Print("ReceiverEA: Preparing Heartbeat JSON: ", heartbeatMsg);
+        // Print("ReceiverEA: Preparing Heartbeat JSON: ", heartbeatMsg); // Commented out for quieter logs
 
         if (g_clientSocket.Send(msgWithNewline)) {
             if (g_clientSocket.IsSocketConnected()) {

@@ -133,7 +133,7 @@ const server = net.createServer(socket => {
                     }
 
                 } else if (message.type === 'heartbeat') {
-                    // console.log(`Heartbeat from ${currentClient.accountId || clientId}`);
+                    // console.log(`Heartbeat from ${currentClient.accountId || clientId}`); // Already commented, ensure any other verbose log is also commented
                     socket.write(JSON.stringify({type: "ack", message: "Heartbeat received"}) + "\n");
                 } else if (message.type === 'tradeEvent') {
                     if (currentClient.role === 'sender' && currentClient.accountId) {
